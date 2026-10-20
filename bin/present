@@ -3,12 +3,13 @@
 # present: Windows-style (Win+P) display modes for Omarchy.
 #
 #   present status                      JSON state for the picker
-#   present set <mode>                  duplicate | extend | external | internal | ignore
+#   present set <mode>                  duplicate | match | extend | external | internal | ignore
 #   present position <dir>              extend direction: right | left | up | down
 #   present scale <up|down|reset>       external display scale
 #   present hotplug [--force]           reconcile after a display was added/removed
 #                                       (--force: a config reload also happened)
 #   present reapply                     re-apply after Hyprland reloaded its config
+#   present fit                         Match the TV: keep fullscreen windows in the mirrored area
 #   present title [text]                top line of the card shown in Laptop screen
 #                                       only ("Back at 3:15"); no text clears it
 #
@@ -32,6 +33,7 @@ DB="$STATE_DIR/displays.json"
 LOG="$STATE_DIR/present.log"
 LOCK="$RUNTIME_DIR/lock"
 APPLIED="$RUNTIME_DIR/applied-${HYPRLAND_INSTANCE_SIGNATURE:-session}"
+MATCH_STATE="$RUNTIME_DIR/match.json" # the strip Match the TV reserved on the laptop
 CARD_STATE="$RUNTIME_DIR/card.json" # which output shows the card; Service.qml watches it
 CARD_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/$PLUGIN_ID/card.json"
 MIRROR_CLASS=at.yrlf.wl_mirror
@@ -185,13 +187,76 @@ monitor_rule() {
 # Pin the laptop display at the origin with whatever mode and scale the user's
 # config gave it, so parking or placing an external never moves it.
 internal_pin_rule() {
-  local monitor name
+  local reserve="${1:-}" monitor name
   monitor=$(internal_monitor)
   [[ -n $monitor ]] || return 0
   jq -e '.disabled == false' <<<"$monitor" >/dev/null || return 0
   name=$(jq -r '.name' <<<"$monitor")
   safe_name "$name" || return 0
-  jq -r '"hl.monitor({ output = \"\(.name)\", mode = \"\(.width)x\(.height)@\(.refreshRate)\", position = \"0x0\", scale = \(.scale), transform = \(.transform) })"' <<<"$monitor"
+  jq -r --arg reserve "$reserve" '"hl.monitor({ output = \"\(.name)\", mode = \"\(.width)x\(.height)@\(.refreshRate)\", position = \"0x0\", scale = \(.scale), transform = \(.transform)\(if $reserve == "" then "" else ", reserved_area = { top = \($reserve) }" end) })"' <<<"$monitor"
+}
+
+# Match the TV: the laptop's desktop shrinks to the TV's shape, flush with the
+# bottom of the panel, and only that part is mirrored, so the TV is filled with
+# no bars and nothing stretched. The panel itself stays at its native mode
+# (laptop panels take no other); the space above is reserved, and the bar sits
+# in it. Prints "<strip> <reserve> <width> <height>" in logical pixels, or
+# nothing when the TV isn't wider than the laptop.
+#
+# A reserved area adds to the bar's own, so the reserve is the strip minus the
+# bar. The bar's height is what is reserved now, less our own reserve if it is
+# still in place (a config reload drops it).
+match_geometry() {
+  local monitor="$1" tv_w="$2" tv_h="$3" top prev_reserve=0 prev_total=-1 bar
+  [[ $tv_w =~ ^[0-9]+$ && $tv_h =~ ^[0-9]+$ ]] && ((tv_w > 0 && tv_h > 0)) || return 0
+  [[ -s $MATCH_STATE ]] && read -r prev_reserve prev_total < <(jq -r '"\(.reserve) \(.total)"' "$MATCH_STATE")
+  top=$(jq -r '.reserved[1] // 0' <<<"$monitor")
+  bar=$top
+  ((top == prev_total)) && bar=$((top - prev_reserve))
+  jq -r '"\(.width) \(.height) \(.scale) \(.transform)"' <<<"$monitor" | {
+    read -r w h scale transform
+    ((transform % 2)) && { local t=$w; w=$h; h=$t; }
+    awk -v w="$w" -v h="$h" -v s="$scale" -v tw="$tv_w" -v th="$tv_h" -v bar="$bar" 'BEGIN {
+      W = int(w / s + 0.5); H = int(h / s + 0.5)
+      area = int(W * th / tw + 0.5)
+      if (area >= H) exit
+      strip = H - area
+      reserve = strip - bar; if (reserve < 0) reserve = 0
+      printf "%d %d %d %d\n", strip, reserve, W, area
+    }'
+  }
+}
+
+# Leave Match the TV: give the laptop its full height back, and windows that
+# were held inside the mirrored area go properly fullscreen again.
+match_undo() {
+  local rule addr id
+  [[ -f $MATCH_STATE ]] || return 0
+  rule=$(internal_pin_rule 0)
+  [[ -n $rule ]] && hyprctl eval "$rule" >/dev/null
+  rm -f "$MATCH_STATE"
+  id=$(internal_monitor | jq -r '.id // empty')
+  [[ -n $id ]] || return 0
+  hyprctl clients -j | jq -r --argjson m "$id" '.[] | select(.monitor == $m and .fullscreen == 1 and .fullscreenClient == 2) | .address' |
+    while read -r addr; do
+      [[ $addr =~ ^0x[0-9a-f]+$ ]] && hypr "hl.dsp.window.fullscreen_state({ window = \"address:$addr\", internal = 2, client = 2 })"
+    done
+  return 0
+}
+
+# A window going fullscreen on the laptop would cover the strip too, and the
+# TV would show it cropped. Hold it maximized inside the mirrored area while
+# the app still believes it is fullscreen (and hides its toolbars).
+cmd_fit() {
+  local id addr
+  [[ -s $MATCH_STATE ]] || return 0
+  id=$(internal_monitor | jq -r '.id // empty')
+  [[ -n $id ]] || return 0
+  hyprctl clients -j | jq -r --argjson m "$id" '.[] | select(.monitor == $m and .fullscreen == 2) | .address' |
+    while read -r addr; do
+      [[ $addr =~ ^0x[0-9a-f]+$ ]] && hypr "hl.dsp.window.fullscreen_state({ window = \"address:$addr\", internal = 1, client = 2 })"
+    done
+  return 0
 }
 
 # The rules for every connected external, from its saved profile.
@@ -219,10 +284,16 @@ render_rules() {
     # laptop screen off there is nothing to duplicate, so the external becomes
     # the main screen until it comes back.
     ((i > 0)) && display=extend
-    [[ $display == duplicate ]] && ! internal_active && display=external
+    [[ $display =~ ^(duplicate|match)$ ]] && ! internal_active && display=external
 
     if ((!pinned)); then
-      internal_pin_rule
+      if [[ -n ${MATCH_GEOM:-} ]]; then
+        internal_pin_rule "$(cut -d' ' -f2 <<<"$MATCH_GEOM")"
+      elif [[ -f $MATCH_STATE ]]; then
+        internal_pin_rule 0
+      else
+        internal_pin_rule
+      fi
       pinned=1
     fi
 
@@ -233,7 +304,7 @@ render_rules() {
       internal) monitor_rule "$name" "$mode" "$FAR_POSITION" "$scale" ;;
       external) monitor_rule "$name" "$mode" auto "$scale" ;;
       extend) monitor_rule "$name" "$mode" "auto-$position" "$scale" ;;
-      duplicate)
+      duplicate | match)
         monitor_rule "$name" "$mode" "$FAR_POSITION" "$scale"
         printf 'hl.window_rule({ match = { class = "%s" }, fullscreen = true, no_initial_focus = true, no_focus = true, no_anim = true, border_size = 0, idle_inhibit = "always" })\n' "$MIRROR_CLASS_RE"
         ;;
@@ -305,7 +376,7 @@ mode_took() {
       # Gone or off counts too: Don't manage, or a TV that dropped out anyway.
       internal) [[ -z $monitor ]] || jq -e '.disabled == true or .x == 20000' <<<"$monitor" >/dev/null && return 0 ;;
       extend) [[ -n $monitor ]] && usable "$monitor" && jq -e '.disabled == false and .x != 20000' <<<"$monitor" >/dev/null && return 0 ;;
-      duplicate) [[ -n $monitor ]] && usable "$monitor" && jq -e '.disabled == false' <<<"$monitor" >/dev/null &&
+      duplicate | match) [[ -n $monitor ]] && usable "$monitor" && jq -e '.disabled == false' <<<"$monitor" >/dev/null &&
         { ! internal_active || mirror_running_on "$name"; } && return 0 ;;
       external)
         if [[ -n $monitor ]] && usable "$monitor" && jq -e '.disabled == false' <<<"$monitor" >/dev/null && ! internal_active; then
@@ -337,16 +408,22 @@ mirror_wanted() {
   local target="$1" monitor
   monitor=$(primary)
   [[ -n $monitor && $(jq -r '.name' <<<"$monitor") == "$target" ]] || return 1
-  [[ $(profile_field "$(profile_get "$(display_key "$monitor")")" display) == duplicate ]] || return 1
+  [[ $(profile_field "$(profile_get "$(display_key "$monitor")")" display) =~ ^(duplicate|match)$ ]] || return 1
   internal_active
 }
 
+# REGION ("x,y wxh", layout coordinates) mirrors only that part of the laptop.
 cmd_mirror() {
-  local target="$1" source="$2" started status restarts=0 window_start=$SECONDS
+  local target="$1" source="$2" region="${3:-}" started status restarts=0 window_start=$SECONDS
+  local args=()
   safe_name "$target" && safe_name "$source" || exit 1
+  if [[ -n $region ]]; then
+    [[ $region =~ ^[0-9]+,[0-9]+\ [0-9]+x[0-9]+$ ]] || exit 1
+    args=(--region "$region")
+  fi
   while true; do
     started=$SECONDS
-    wl-mirror --fullscreen-output "$target" "$source" >/dev/null 2>&1 </dev/null
+    wl-mirror --fullscreen-output "$target" "${args[@]}" "$source" >/dev/null 2>&1 </dev/null
     status=$?
     mirror_wanted "$target" || break
 
@@ -369,7 +446,7 @@ mirror_window() {
 }
 
 start_mirror() {
-  local target="$1" source
+  local target="$1" region="${2:-}" source
   source=$(internal_name)
   [[ -n $source ]] && safe_name "$source" || return 1
 
@@ -378,14 +455,15 @@ start_mirror() {
     return 1
   fi
 
-  if ! mirror_running_on "$target"; then
+  # The same target with another region (Duplicate <-> Match the TV) restarts it.
+  if ! pgrep -f "[/]present mirror $target $source${region:+ $region}\$" >/dev/null; then
     stop_mirror
     # A new output takes the first free workspace (often 1). Open the mirror on
     # its own workspace on the projector instead, so SUPER + 1-9 stay on the laptop.
     hypr "hl.dsp.focus({ monitor = \"$target\" })"
     hypr "hl.dsp.focus({ workspace = \"$MIRROR_WORKSPACE\" })"
     # 9>&- : the mirror outlives this script and must not hold its lock.
-    setsid -f "$(readlink -f "$0")" mirror "$target" "$source" >/dev/null 2>&1 </dev/null 9>&-
+    setsid -f "$(readlink -f "$0")" mirror "$target" "$source" ${region:+"$region"} >/dev/null 2>&1 </dev/null 9>&-
   fi
   settle_mirror "$target" "$source"
 }
@@ -444,6 +522,7 @@ apply() {
       while IFS= read -r line; do [[ -n $line ]] && hyprctl eval "$line" >/dev/null; done <<<"$rules"
       printf '%s\n' "$rules" >"$APPLIED"
       card_output ""
+      match_undo
       internal_off
       log "apply display=external output=$name (laptop screen off)"
       return
@@ -463,7 +542,13 @@ apply() {
 
   # A reload dropped the mirror's window rule and moved the projector under it.
   # Start it fresh once the rules are back, rather than leave it half set up.
-  ((force)) && [[ $display == duplicate ]] && stop_mirror
+  ((force)) && [[ $display =~ ^(duplicate|match)$ ]] && stop_mirror
+
+  MATCH_GEOM=""
+  if [[ $display == match ]] && internal_active; then
+    MATCH_GEOM=$(match_geometry "$(internal_monitor)" "$(jq -r '.width' <<<"$monitor")" "$(jq -r '.height' <<<"$monitor")")
+    [[ -n $MATCH_GEOM ]] || log "match: $name isn't wider than the laptop; plain Duplicate"
+  fi
 
   rules=$(render_rules)
   if ((force)) || [[ ! -f $APPLIED || $(<"$APPLIED") != "$rules" ]]; then
@@ -474,10 +559,25 @@ apply() {
     printf '%s\n' "$rules" >"$APPLIED"
   fi
 
-  if [[ $display == duplicate ]] && internal_active; then
+  if [[ -n $MATCH_GEOM ]]; then
+    local strip reserve width height total
+    read -r strip reserve width height <<<"$MATCH_GEOM"
+    total=$(internal_monitor | jq -r '.reserved[1] // 0')
+    jq -nc --argjson r "$reserve" --argjson t "$total" --argjson s "$strip" --argjson w "$width" --argjson h "$height" \
+      '{reserve: $r, total: $t, strip: $s, width: $w, height: $h}' >"$MATCH_STATE"
+  else
+    match_undo
+  fi
+
+  if [[ $display =~ ^(duplicate|match)$ ]] && internal_active; then
     card_output ""
     sleep 0.3 # the output needs a moment after a mode change
-    start_mirror "$name"
+    if [[ -n $MATCH_GEOM ]]; then
+      start_mirror "$name" "0,$strip ${width}x$height"
+      cmd_fit
+    else
+      start_mirror "$name"
+    fi
   elif [[ $display == internal ]]; then
     stop_mirror
     card_output "$name"
@@ -498,6 +598,7 @@ with_lock() {
 label() {
   case $1 in
     duplicate) echo "Duplicate" ;;
+    match) echo "Match the TV" ;;
     extend) echo "Extend" ;;
     external) echo "Second screen only" ;;
     internal) echo "Laptop screen only" ;;
@@ -540,7 +641,7 @@ switch_to() {
 
 cmd_set() {
   local display="$1" monitor name key profile
-  [[ $display =~ ^(duplicate|extend|external|internal|ignore)$ ]] || { echo "Unknown mode: $display" >&2; exit 1; }
+  [[ $display =~ ^(duplicate|match|extend|external|internal|ignore)$ ]] || { echo "Unknown mode: $display" >&2; exit 1; }
   require_primary
 
   if [[ $display == ignore ]]; then
@@ -548,6 +649,7 @@ cmd_set() {
     # Drop our runtime rules: the user's own config takes the display back.
     stop_mirror
     card_output ""
+    rm -f "$MATCH_STATE" # the reload below drops its reserve
     internal_disabled_by_omarchy && omarchy-hyprland-monitor-internal on >/dev/null 2>&1
     rm -f "$APPLIED"
     hyprctl reload >/dev/null 2>&1
@@ -604,6 +706,7 @@ cmd_hotplug() {
   if [[ -z $monitor ]]; then
     stop_mirror
     card_output ""
+    match_undo
     rm -f "$APPLIED"
     # Unplugged in Second screen only: turn the laptop back on ourselves.
     # Omarchy's own recover counts Hyprland's FALLBACK output as an external and
@@ -683,6 +786,7 @@ case "${1:-}" in
   hotplug) with_lock cmd_hotplug "${2:-}" ;;
   reapply) with_lock apply 1 ;;
   title) shift; cmd_title "$@" ;;
-  mirror) cmd_mirror "${2:-}" "${3:-}" ;;
-  *) sed -n '3,13p' "$0"; exit 1 ;;
+  fit) with_lock cmd_fit ;;
+  mirror) cmd_mirror "${2:-}" "${3:-}" "${4:-}" ;;
+  *) sed -n '3,14p' "$0"; exit 1 ;;
 esac

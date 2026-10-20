@@ -54,6 +54,11 @@ Item {
   }
 
   Process {
+    id: fit
+    command: [root.cli, "fit"]
+  }
+
+  Process {
     id: hotplug
     stdout: StdioCollector {
       onStreamFinished: if (text.trim() === "new") root.openPicker()
@@ -69,6 +74,10 @@ Item {
       } else if (event.name === "monitoraddedv2" || event.name === "monitorremovedv2") {
         root.displaysChanged = true
         root.reconcile()
+      } else if (event.name === "fullscreen" && event.data === "1" && !fit.running) {
+        // Match the TV keeps fullscreen windows inside the mirrored area; the
+        // script returns at once in every other mode.
+        fit.running = true
       }
     }
   }

@@ -25,7 +25,8 @@ Item {
     { id: "internal", title: "Laptop screen only", hint: "Name card on the projector" },
     { id: "duplicate", title: "Duplicate", hint: "Same picture, no stretching" },
     { id: "extend", title: "Extend", hint: "Second desktop" },
-    { id: "external", title: "Second screen only", hint: "Laptop screen off" }
+    { id: "external", title: "Second screen only", hint: "Laptop screen off" },
+    { id: "match", title: "Match the TV", hint: "Duplicate, no bars" }
   ]
 
   property color background: Color.menu.background
@@ -85,7 +86,7 @@ Item {
   function apply(index) {
     if (!status.connected) return
     var mode = modes[index].id
-    if (mode === "duplicate" && !status.mirrorAvailable) return
+    if ((mode === "duplicate" || mode === "match") && !status.mirrorAvailable) return
     // Launch first: dismiss() makes the shell unload this overlay, and nothing
     // on it can run afterwards.
     root.run(["set", mode])
@@ -155,7 +156,7 @@ Item {
           else if (k === Qt.Key_Left || k === Qt.Key_H) root.select(-1)
           else if (k === Qt.Key_Right || k === Qt.Key_L || k === Qt.Key_P || k === Qt.Key_Tab) root.select(1)
           else if (k === Qt.Key_Return || k === Qt.Key_Enter || k === Qt.Key_Space) root.apply(root.selectedIndex)
-          else if (k >= Qt.Key_1 && k <= Qt.Key_4) root.apply(k - Qt.Key_1)
+          else if (k >= Qt.Key_1 && k <= Qt.Key_5) root.apply(k - Qt.Key_1)
           else if (k === Qt.Key_Equal || k === Qt.Key_Plus) root.adjust(["scale", "up"])
           else if (k === Qt.Key_Minus) root.adjust(["scale", "down"])
           else if (k === Qt.Key_0) root.adjust(["scale", "reset"])
@@ -202,7 +203,7 @@ Item {
               required property int index
               readonly property bool current: root.status.connected && root.status.display === modelData.id
               readonly property bool unavailable: !root.status.connected
-                || (modelData.id === "duplicate" && !root.status.mirrorAvailable)
+                || ((modelData.id === "duplicate" || modelData.id === "match") && !root.status.mirrorAvailable)
 
               width: root.tileWidth
               height: root.tileHeight
@@ -236,7 +237,7 @@ Item {
                 }
                 Text {
                   anchors.horizontalCenter: parent.horizontalCenter
-                  text: tile.modelData.id === "duplicate" && !root.status.mirrorAvailable
+                  text: (tile.modelData.id === "duplicate" || tile.modelData.id === "match") && !root.status.mirrorAvailable
                     ? "Needs wl-mirror" : (tile.current ? "Current" : tile.modelData.hint)
                   color: root.foreground
                   opacity: 0.55
@@ -315,7 +316,7 @@ Item {
         }
 
         Text {
-          text: "←/→ or P to choose   Enter to apply   1–4 apply directly   +/− size   Esc to close"
+          text: "←/→ or P to choose   Enter to apply   1–5 apply directly   +/− size   Esc to close"
           color: root.foreground
           opacity: 0.4
           font.family: root.fontFamily
