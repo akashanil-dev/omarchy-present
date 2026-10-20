@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Renamed to Present the Screen. The plugin id, the `present` command and the
+  saved settings are unchanged.
+- Match the TV (key 5): Duplicate without black bars. The laptop's desktop
+  takes the TV's shape at the bottom of the screen, and only that part is
+  mirrored. Fullscreen windows stay inside it.
+- Sound: the picker shows the outputs that are plugged in and the one playing,
+  switches between them (changing the card profile when needed), and
+  remembers the choice per display.
+- Brightness: DDC/CI with ddcutil where the display takes it, otherwise a
+  dimming layer, and the picker says which.
+- A bar icon showing the mode: click for the picker, scroll for brightness.
+
 - Laptop screen only keeps the projector's signal and shows a card instead: an
   optional title line, your name and site, a QR code, and the time. Set it up
   in `~/.config/io.github.akashanil-dev.present/card.json`, or the title with

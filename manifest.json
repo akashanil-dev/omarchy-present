@@ -1,17 +1,26 @@
 {
   "schemaVersion": 1,
   "id": "io.github.akashanil-dev.present",
-  "name": "Present",
+  "name": "Present the Screen",
   "version": "1.0.0",
   "author": "Akash A",
   "license": "MIT",
-  "description": "Windows-style projector modes (SUPER + P): Duplicate without stretching, Extend, laptop or second screen only, with readable scaling on any TV or projector.",
+  "description": "Windows-style projector modes (SUPER + P): Duplicate without stretching or matched to the TV, Extend, laptop or second screen only, with sound output, brightness and a bar icon.",
   "kinds": [
     "service",
-    "overlay"
+    "overlay",
+    "bar-widget"
   ],
   "entryPoints": {
     "service": "Service.qml",
-    "overlay": "Picker.qml"
+    "overlay": "Picker.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Present the Screen",
+    "description": "Current projector mode; click to change, scroll for brightness",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
   }
 }

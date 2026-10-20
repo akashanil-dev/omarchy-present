@@ -10,6 +10,8 @@
 #                                       (--force: a config reload also happened)
 #   present reapply                     re-apply after Hyprland reloaded its config
 #   present fit                         Match the TV: keep fullscreen windows in the mirrored area
+#   present audio [set <id>]           sound outputs as JSON, or switch to one
+#   present brightness <up|down|reset>  the external's brightness (DDC/CI, else dimming)
 #   present title [text]                top line of the card shown in Laptop screen
 #                                       only ("Back at 3:15"); no text clears it
 #
@@ -34,7 +36,7 @@ LOG="$STATE_DIR/present.log"
 LOCK="$RUNTIME_DIR/lock"
 APPLIED="$RUNTIME_DIR/applied-${HYPRLAND_INSTANCE_SIGNATURE:-session}"
 MATCH_STATE="$RUNTIME_DIR/match.json" # the strip Match the TV reserved on the laptop
-CARD_STATE="$RUNTIME_DIR/card.json" # which output shows the card; Service.qml watches it
+OVERLAY_STATE="$RUNTIME_DIR/overlay.json" # the card and the dimming layer; Service.qml watches it
 CARD_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/$PLUGIN_ID/card.json"
 MIRROR_CLASS=at.yrlf.wl_mirror
 MIRROR_CLASS_RE='^at\\.yrlf\\.wl_mirror$' # as a Lua string
@@ -353,13 +355,37 @@ internal_on() {
   hypr 'hl.dsp.dpms({ action = "enable" })'
 }
 
-# Tell the service which output shows the card, "" for none. Written in place,
-# not replaced, so the service's file watch stays on the same file.
-card_output() {
-  local current=""
-  [[ -f $CARD_STATE ]] && current=$(jq -r '.output // ""' "$CARD_STATE" 2>/dev/null)
-  [[ $current == "$1" && -f $CARD_STATE ]] && return 0
-  jq -nc --arg o "$1" '{output: $o}' >"$CARD_STATE"
+# What the service draws: the card on CARD, and a black layer of opacity DIM
+# over DIM_OUTPUT. Written in place, not replaced, so the service's file
+# watch stays on the same file, and only when something changed.
+overlay_set() {
+  local filter="$1" current next
+  shift
+  current='{"card": "", "dimOutput": "", "dim": 0}'
+  [[ -s $OVERLAY_STATE ]] && current=$(jq -c '{card: (.card // ""), dimOutput: (.dimOutput // ""), dim: (.dim // 0)}' "$OVERLAY_STATE" 2>/dev/null || echo "$current")
+  next=$(jq -c "$@" "$filter" <<<"$current") || return 0
+  [[ $next == "$current" && -s $OVERLAY_STATE ]] && return 0
+  printf '%s\n' "$next" >"$OVERLAY_STATE"
+}
+
+card_output() { overlay_set '.card = $o' --arg o "$1"; }
+
+# Dim the primary external in software when its brightness is below 100% and
+# it doesn't take DDC/CI brightness commands.
+dim_update() {
+  local monitor profile brightness level=0 name=""
+  monitor=$(primary)
+  if [[ -n $monitor ]] && usable "$monitor"; then
+    profile=$(profile_get "$(display_key "$monitor")")
+    if [[ -n $profile && $(profile_field "$profile" display) != ignore && $(profile_field "$profile" ddc) != true ]]; then
+      brightness=$(jq -r '.brightness // 100' <<<"$profile")
+      if [[ $brightness =~ ^[0-9]+$ ]] && ((brightness < 100)); then
+        name=$(jq -r '.name' <<<"$monitor")
+        level=$(awk -v b="$brightness" 'BEGIN { printf "%.2f", (100 - b) / 100 }')
+      fi
+    fi
+  fi
+  overlay_set '.dimOutput = $n | .dim = $l' --arg n "$name" --argjson l "$level"
 }
 
 monitor_by_name() {
@@ -507,6 +533,7 @@ apply() {
     name=$(jq -r '.name' <<<"$monitor")
     display=$(profile_field "$(profile_get "$(display_key "$monitor")")" display)
   fi
+  dim_update
 
   # A display Hyprland has no modes for can't show anything: keep the laptop
   # screen on and wait for it to be replugged.
@@ -650,6 +677,7 @@ cmd_set() {
     stop_mirror
     card_output ""
     rm -f "$MATCH_STATE" # the reload below drops its reserve
+    dim_update
     internal_disabled_by_omarchy && omarchy-hyprland-monitor-internal on >/dev/null 2>&1
     rm -f "$APPLIED"
     hyprctl reload >/dev/null 2>&1
@@ -706,6 +734,7 @@ cmd_hotplug() {
   if [[ -z $monitor ]]; then
     stop_mirror
     card_output ""
+    dim_update
     match_undo
     rm -f "$APPLIED"
     # Unplugged in Second screen only: turn the laptop back on ourselves.
@@ -731,13 +760,199 @@ cmd_hotplug() {
     profile_put "$key" "$(new_profile "$monitor")"
     profile_seen "$key" "$(jq -r '.name' <<<"$monitor")"
     apply "$force"
+    ddc_probe_later
     echo "new"
     return
   fi
 
   profile_seen "$key" "$(jq -r '.name' <<<"$monitor")"
   apply "$force"
+  ((force)) || audio_restore_later "$(profile_field "$(profile_get "$key")" audio)"
+  ddc_probe_later
   echo "known"
+}
+
+# --- Sound ---------------------------------------------------------------
+#
+# Sound outputs are every card's output ports not known to be unplugged, not
+# just the current sinks: on many laptops the speakers and the headphone jack
+# sit in different card profiles, so the speakers only appear as a sink once
+# the profile is switched. HDMI and DisplayPort outputs are named after the
+# connected display.
+
+audio_outputs() {
+  local cards sinks default ext
+  command -v pactl >/dev/null || { echo '[]'; return; }
+  cards=$(pactl -f json list cards 2>/dev/null) || { echo '[]'; return; }
+  sinks=$(pactl -f json list sinks 2>/dev/null || echo '[]')
+  default=$(pactl get-default-sink 2>/dev/null)
+  ext=$(primary | jq -r '(.description // "") as $d | if $d != "" then ($d | sub(" 0x[0-9A-Fa-f]+$"; "")) else (.name // "") end' 2>/dev/null)
+  jq -c --argjson sinks "$sinks" --arg default "$default" --arg ext "$ext" '
+    [.[] as $card
+     | ($card.ports // {} | to_entries[])
+     | select((.key | startswith("[Out]")) or (.key | test("output"; "i")))
+     | select(.value.availability != "not available")
+     | .key as $port | .value as $p
+     | ([$sinks[] | select(.properties["device.id"] == ($card.index | tostring) and ([.ports[]?.name] | index($port)))][0].name // "") as $sink
+     | {
+         id: ($card.name + "|" + $port),
+         sink: $sink,
+         active: ($sink != "" and $sink == $default),
+         label: (
+           if ($p.type // "") == "HDMI" or ($port | test("hdmi|displayport"; "i")) then (if $ext != "" then $ext else $p.description end)
+           elif ($card.properties["device.bus"] // "") == "bluetooth" then ($card.properties["device.description"] // $p.description)
+           elif ($p.type // "") == "Speaker" or ($port | test("speaker"; "i")) then "Laptop speakers"
+           else $p.description end)
+       }]' <<<"$cards"
+}
+
+audio_sink_for() {
+  local card="$1" port="$2"
+  pactl -f json list cards 2>/dev/null | jq -r --arg c "$card" '.[] | select(.name == $c) | .index' | {
+    read -r index
+    pactl -f json list sinks 2>/dev/null | jq -r --arg i "$index" --arg p "$port" \
+      '[.[] | select(.properties["device.id"] == $i and ([.ports[]?.name] | index($p)))][0].name // empty'
+  }
+}
+
+# Switch to output ID ("card|port"), changing the card's profile first when
+# no current sink has that port.
+audio_select() {
+  local id="$1" card port sink profile i
+  [[ $id == *"|"* ]] || return 1
+  card=${id%%|*}
+  port=${id#*|}
+  audio_outputs | jq -e --arg id "$id" 'any(.[]; .id == $id)' >/dev/null || return 1
+  sink=$(audio_sink_for "$card" "$port")
+  if [[ -z $sink ]]; then
+    profile=$(pactl -f json list cards 2>/dev/null | jq -r --arg c "$card" --arg p "$port" '
+      .[] | select(.name == $c) | .profiles as $all
+      | [.ports[$p].profiles[]? | {k: ., v: $all[.]} | select(.v.available != false)]
+      | max_by(.v.priority) | .k // empty')
+    [[ -n $profile ]] || return 1
+    pactl set-card-profile "$card" "$profile" || return 1
+    for ((i = 0; i < 30; i++)); do
+      sink=$(audio_sink_for "$card" "$port")
+      [[ -n $sink ]] && break
+      sleep 0.1
+    done
+  fi
+  [[ -n $sink ]] || return 1
+  pactl set-sink-port "$sink" "$port" 2>/dev/null
+  pactl set-default-sink "$sink"
+}
+
+cmd_audio() {
+  local id monitor key profile
+  if [[ ${1:-} != set ]]; then
+    audio_outputs
+    return
+  fi
+  id="${2:-}"
+  if ! audio_select "$id"; then
+    notify "Couldn't switch the sound" "That output isn't available any more."
+    exit 1
+  fi
+  # Remember it for the connected display, so it comes back on reconnect.
+  monitor=$(primary)
+  if [[ -n $monitor ]] && usable "$monitor"; then
+    key=$(display_key "$monitor")
+    profile=$(profile_get "$key")
+    [[ -n $profile ]] && profile_put "$key" "$(jq -c --arg a "$id" '.audio = $a' <<<"$profile")"
+  fi
+  log "audio $id"
+}
+
+# Ask a new display about DDC/CI in the background; it can take seconds.
+ddc_probe_later() {
+  [[ $(profile_field "$(profile_get "$(display_key "$(primary)")")" ddc 2>/dev/null) == null ]] || return 0
+  setsid -f "$(readlink -f "$0")" ddc-probe >/dev/null 2>&1 </dev/null 9>&-
+}
+
+# PipeWire picks HDMI sound by itself a moment after the display appears, so
+# a saved choice is put back after it has had its say.
+audio_restore_later() {
+  local id="$1"
+  [[ -n $id && $id != null ]] || return 0
+  (sleep 3; audio_select "$id" && log "audio restored $id") >/dev/null 2>&1 </dev/null 9>&- &
+  disown
+}
+
+# --- Brightness ------------------------------------------------------------
+#
+# A monitor that speaks DDC/CI gets its real backlight changed with ddcutil.
+# TVs almost never do, so for them the picture is dimmed with a black layer
+# instead: darker, though blacks turn a little grey since the backlight stays.
+
+ddc_bus() {
+  local link
+  link=$(readlink -f /sys/class/drm/card*-"$1"/ddc 2>/dev/null | head -1)
+  [[ $link =~ i2c-([0-9]+)$ ]] && echo "${BASH_REMATCH[1]}"
+}
+
+# "current max" from the display, or nothing when it doesn't answer.
+ddc_get() {
+  local bus
+  command -v ddcutil >/dev/null || return 1
+  bus=$(ddc_bus "$1")
+  [[ -n $bus ]] || return 1
+  timeout 8 ddcutil --bus "$bus" getvcp 10 --brief 2>/dev/null | awk '$1 == "VCP" && $3 == "C" { print $4, $5; found = 1 } END { exit !found }'
+}
+
+ddc_set() {
+  local bus
+  bus=$(ddc_bus "$1")
+  [[ -n $bus ]] && timeout 8 ddcutil --bus "$bus" setvcp 10 "$2" >/dev/null 2>&1
+}
+
+# Ask the display once whether it takes brightness commands, and save the
+# answer (and its current brightness) in its profile.
+ddc_probe() {
+  local key="$1" name="$2" reply profile
+  profile=$(profile_get "$key")
+  [[ -n $profile ]] || return 1
+  if reply=$(ddc_get "$name"); then
+    read -r current max <<<"$reply"
+    profile=$(jq -c --argjson c "$current" --argjson m "$max" '.ddc = true | .brightness = (if $m > 0 then ($c * 100 / $m | floor) else 100 end)' <<<"$profile")
+  else
+    profile=$(jq -c '.ddc = false' <<<"$profile")
+  fi
+  profile_put "$key" "$profile"
+}
+
+cmd_ddc_probe() {
+  local monitor key
+  monitor=$(primary)
+  [[ -n $monitor ]] && usable "$monitor" || return 0
+  key=$(display_key "$monitor")
+  [[ $(profile_field "$(profile_get "$key")" ddc) == null ]] || return 0
+  ddc_probe "$key" "$(jq -r '.name' <<<"$monitor")"
+  dim_update
+}
+
+cmd_brightness() {
+  local step="${1:-}" monitor name key profile current next reply max
+  require_primary
+  [[ $(profile_field "$profile" ddc) == null ]] && { ddc_probe "$key" "$name"; profile=$(profile_get "$key"); }
+  current=$(jq -r '.brightness // 100' <<<"$profile")
+  case $step in
+    up) next=$((current + 10)) ;;
+    down) next=$((current - 10)) ;;
+    reset) next=100 ;;
+    *) echo "Usage: present brightness <up|down|reset>" >&2; exit 1 ;;
+  esac
+  ((next > 100)) && next=100
+
+  if [[ $(profile_field "$profile" ddc) == true ]]; then
+    ((next < 0)) && next=0
+    reply=$(ddc_get "$name") && read -r _ max <<<"$reply"
+    ddc_set "$name" "$((next * ${max:-100} / 100))" || notify "Brightness didn't change" "$key stopped answering."
+  else
+    # Dimming below a fifth would leave the room unable to read anything.
+    ((next < 20)) && next=20
+  fi
+  profile_put "$key" "$(jq -c --argjson b "$next" '.brightness = $b' <<<"$profile")"
+  dim_update
 }
 
 # The card's settings live in CARD_CONFIG (name, site, qr, title, clock); see
@@ -766,6 +981,8 @@ cmd_status() {
     --argjson profile "$profile" \
     --arg key "$key" \
     --argjson mirror "$(command -v wl-mirror >/dev/null && echo true || echo false)" \
+    --argjson audio "$(audio_outputs)" \
+    --argjson ddcutil "$(command -v ddcutil >/dev/null && echo true || echo false)" \
     '{
       connected: ($monitor != null),
       name: ($monitor.name // ""),
@@ -774,7 +991,11 @@ cmd_status() {
       display: ($profile.display // ""),
       position: ($profile.position // "right"),
       scale: ($profile.scale // 1),
-      mirrorAvailable: $mirror
+      mirrorAvailable: $mirror,
+      audio: $audio,
+      brightness: ($profile.brightness // 100),
+      brightnessMethod: (if $profile.ddc == true then "ddc" elif $profile.ddc == false then "dim" else "unknown" end),
+      ddcutil: $ddcutil
     }'
 }
 
@@ -786,7 +1007,10 @@ case "${1:-}" in
   hotplug) with_lock cmd_hotplug "${2:-}" ;;
   reapply) with_lock apply 1 ;;
   title) shift; cmd_title "$@" ;;
+  audio) shift; cmd_audio "$@" ;;
+  brightness) with_lock cmd_brightness "${2:-}" ;;
+  ddc-probe) with_lock cmd_ddc_probe ;;
   fit) with_lock cmd_fit ;;
   mirror) cmd_mirror "${2:-}" "${3:-}" "${4:-}" ;;
-  *) sed -n '3,14p' "$0"; exit 1 ;;
+  *) sed -n '3,16p' "$0"; exit 1 ;;
 esac

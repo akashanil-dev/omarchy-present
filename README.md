@@ -1,9 +1,11 @@
-# Present
+# Present the Screen
 
 Windows-style projector modes for [Omarchy](https://omarchy.org). Plug in a
-projector or TV, press `SUPER + P`, pick a mode.
+projector or TV, press `SUPER + P`, pick a mode. Present the Screen ("Present"
+below) also picks where the sound goes, dims a TV that's too bright, and shows
+the current mode in the bar.
 
-![The Present picker](preview.png)
+![The Present the Screen picker](preview.png)
 
 | Mode | What you get |
 |---|---|
@@ -11,6 +13,7 @@ projector or TV, press `SUPER + P`, pick a mode.
 | **2 Duplicate** | The external shows your laptop screen, scaled to fit with black bars. Nothing is stretched, and neither screen changes resolution. |
 | **3 Extend** | A second desktop to the left, right, above or below. |
 | **4 Second screen only** | The laptop screen is turned off. |
+| **5 Match the TV** | Like Duplicate, but no black bars: the laptop's desktop shrinks to the TV's shape, flush with the bottom of the screen, and exactly that part fills the TV. |
 
 ## Why
 
@@ -87,6 +90,53 @@ $P scale up                     # up | down | reset
 $P title "Back at 3:15"         # top line of the card; no text clears it
 ```
 
+### Match the TV
+
+The laptop panel keeps its native resolution (laptop panels take no other), but
+a strip at the top is reserved so the desktop below it has the TV's shape: on a
+16:10 laptop and a 16:9 TV, about a tenth of the height. Your bar sits in that
+strip, so it doesn't show on the TV. A window that goes fullscreen is held
+inside the shaped area, while the app still behaves as fullscreen, so slides
+fill the TV. Choosing another mode or unplugging gives the laptop its full
+height back. With a projector that is narrower than the laptop (4:3), Match
+the TV works like Duplicate.
+
+### Sound
+
+The picker lists every sound output that is plugged in, named after the
+display for HDMI, with the one playing now highlighted. Choose one to switch to
+it; on laptops whose speakers and headphone jack are separate profiles,
+Present switches the profile too. The choice is remembered for that display
+and put back when it is plugged in again. Unplugging still sends the sound back
+to the laptop, since the display it was going to is gone.
+
+```bash
+$P audio                        # outputs as JSON
+$P audio set '<id from the list>'
+```
+
+### Brightness
+
+**Dimmer**, **Brighter** and **Full** in the picker, or scrolling over the bar
+icon, change the external display's brightness in steps of 10%. A monitor that
+accepts DDC/CI commands has its own backlight changed, with
+[`ddcutil`](https://archlinux.org/packages/extra/x86_64/ddcutil/). Most TVs
+don't; for them the picker says so and Present darkens the picture with a
+black layer instead, down to 20%. Clicks go through it, and blacks turn a
+little grey since the backlight stays as bright.
+
+```bash
+$P brightness down              # up | down | reset
+```
+
+### Bar icon
+
+While an external display is connected, an icon in the bar shows the mode.
+Hover for the mode, display, sound output and brightness; click for the
+picker; scroll for brightness. Add it with
+`omarchy plugin enable io.github.akashanil-dev.present --section right`, or
+move it like any other bar widget.
+
 ### The card
 
 In **Laptop screen only** the projector keeps its signal and shows a card in
@@ -158,8 +208,9 @@ Nothing runs as root, and nothing reaches the network.
 - [`wl-mirror`](https://archlinux.org/packages/extra/x86_64/wl-mirror/) for
   Duplicate, from Arch's `extra` repository. The other modes work without it,
   and the picker says when it is missing.
-- `jq` and `hyprctl`, both part of Omarchy
-- Optional: `qrencode`, for the QR code on the card
+- `jq`, `hyprctl` and `pactl`, all part of Omarchy
+- Optional: `qrencode`, for the QR code on the card, and `ddcutil`, for the
+  brightness of monitors that accept DDC/CI
 
 Tested on Omarchy 4.0.0 alpha with Hyprland 0.56.2, Quickshell 0.3.1 and
 wl-mirror 0.18.5.

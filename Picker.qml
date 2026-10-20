@@ -174,7 +174,7 @@ Item {
         Column {
           spacing: Style.spacing.xs
           Text {
-            text: "Project"
+            text: "Present the Screen"
             color: root.foreground
             font.family: root.fontFamily
             font.pixelSize: Style.font.heading
@@ -315,6 +315,63 @@ Item {
           }
         }
 
+        // Sound: every output that isn't known to be unplugged; the active one
+        // is highlighted. Brightness: the display's own when it takes DDC/CI,
+        // otherwise a dimming layer, and the picker says which.
+        Column {
+          visible: root.status.connected
+          spacing: Style.spacing.md
+
+          Row {
+            spacing: Style.spacing.sm
+            visible: (root.status.audio || []).length > 0
+            Text {
+              anchors.verticalCenter: parent.verticalCenter
+              text: "Sound"
+              color: root.foreground
+              opacity: 0.6
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+            Repeater {
+              model: root.status.audio || []
+              delegate: Chip {
+                required property var modelData
+                label: modelData.label
+                active: modelData.active === true
+                onClicked: root.adjust(["audio", "set", modelData.id])
+              }
+            }
+          }
+
+          Row {
+            spacing: Style.spacing.sm
+            Text {
+              anchors.verticalCenter: parent.verticalCenter
+              text: "Brightness " + (root.status.brightness || 100) + "%"
+              color: root.foreground
+              opacity: 0.6
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+            Chip { label: "Dimmer"; onClicked: root.adjust(["brightness", "down"]) }
+            Chip { label: "Brighter"; onClicked: root.adjust(["brightness", "up"]) }
+            Chip { label: "Full"; onClicked: root.adjust(["brightness", "reset"]) }
+            Text {
+              anchors.verticalCenter: parent.verticalCenter
+              visible: text !== ""
+              text: root.status.brightnessMethod === "ddc" ? "Set on the display itself"
+                : root.status.brightnessMethod !== "dim" ? ""
+                : root.status.ddcutil ? "This display doesn't accept brightness commands, so the picture is dimmed instead"
+                : "Dimming the picture. Install ddcutil to control a monitor's own brightness"
+              color: root.foreground
+              opacity: 0.45
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+          }
+        }
+
         Text {
           text: "←/→ or P to choose   Enter to apply   1–5 apply directly   +/− size   Esc to close"
           color: root.foreground
@@ -371,7 +428,7 @@ Item {
       model: 2
       delegate: Rectangle {
         required property int index
-        readonly property bool on: diagramRoot.mode === "duplicate" || diagramRoot.mode === "extend"
+        readonly property bool on: diagramRoot.mode === "duplicate" || diagramRoot.mode === "match" || diagramRoot.mode === "extend"
           || (diagramRoot.mode === "internal" && index === 0)
           || (diagramRoot.mode === "external" && index === 1)
         x: index * (diagramRoot.screenW + Style.spacing.md)

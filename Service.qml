@@ -2,6 +2,7 @@ import QtQuick
 import Quickshell
 import Quickshell.Io
 import Quickshell.Hyprland
+import Quickshell.Wayland
 
 // Watches displays come and go. A display seen before gets its saved mode back
 // silently; a new one starts in Duplicate and opens the picker, like Windows.
@@ -19,8 +20,11 @@ Item {
   property bool reloaded: false
   property bool displaysChanged: false
 
-  // The output showing the card in Laptop screen only; bin/present writes it.
+  // What bin/present asks to draw: the card in Laptop screen only, and the
+  // black layer that dims a display without DDC/CI brightness.
   property string cardOutput: ""
+  property string dimOutput: ""
+  property real dimLevel: 0
   readonly property string runtimeDir: (Quickshell.env("XDG_RUNTIME_DIR") || "/tmp") + "/" + pluginId
 
   // Displays need a moment to settle; a config reload only needs Present's
@@ -83,19 +87,44 @@ Item {
   }
 
   FileView {
-    id: cardState
-    path: root.runtimeDir + "/card.json"
+    id: overlayState
+    path: root.runtimeDir + "/overlay.json"
     watchChanges: true
     printErrors: false
     onLoaded: {
-      try { root.cardOutput = JSON.parse(text()).output || "" } catch (e) { root.cardOutput = "" }
+      var state = {}
+      try { state = JSON.parse(text()) || {} } catch (e) {}
+      root.cardOutput = state.card || ""
+      root.dimOutput = state.dimOutput || ""
+      root.dimLevel = Math.max(0, Math.min(0.8, Number(state.dim) || 0))
     }
     // Create it, so there is a file to watch before the first mode change.
     onLoadFailed: {
       root.cardOutput = ""
-      setText(JSON.stringify({ output: "" }) + "\n")
+      root.dimOutput = ""
+      root.dimLevel = 0
+      setText(JSON.stringify({ card: "", dimOutput: "", dim: 0 }) + "\n")
     }
     onFileChanged: reload()
+  }
+
+  // Dimming: black at the chosen opacity over everything on that display,
+  // letting every click through.
+  Variants {
+    model: root.dimOutput === "" || root.dimLevel <= 0 ? []
+      : Quickshell.screens.filter(function(s) { return s.name === root.dimOutput })
+
+    PanelWindow {
+      required property var modelData
+      screen: modelData
+      anchors { top: true; bottom: true; left: true; right: true }
+      exclusionMode: ExclusionMode.Ignore
+      WlrLayershell.namespace: "omarchy-present-dim"
+      WlrLayershell.layer: WlrLayer.Overlay
+      WlrLayershell.keyboardFocus: WlrKeyboardFocus.None
+      mask: Region {}
+      color: Qt.rgba(0, 0, 0, root.dimLevel)
+    }
   }
 
   Card {
