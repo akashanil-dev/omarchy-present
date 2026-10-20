@@ -98,6 +98,9 @@ usable() { jq -e '.width > 0 or (.availableModes | length) > 0' <<<"$1" >/dev/nu
 # Profiles are saved by description. A display that came up without one (its
 # EDID read failed) gets the profile last used on the same connector instead of
 # a fresh Duplicate one.
+# The key without a trailing EDID serial ("KCM GRANDE TV 0x01010101"), for people.
+display_name() { sed -E 's/ 0x[0-9A-Fa-f]+$//' <<<"$1"; }
+
 display_key() {
   jq -r --slurpfile db "$DB" '
     if (.description // "") != "" then .description
@@ -662,7 +665,7 @@ switch_to() {
   log "$display did not take on $name; back to $(profile_field "$profile" display)"
   profile_put "$key" "$profile"
   apply 1
-  notify "Couldn't switch to $(label "$display")" "$key dropped out during the change. Kept $(label "$(profile_field "$profile" display)")."
+  notify "Couldn't switch to $(label "$display")" "$(display_name "$key") dropped out during the change. Kept $(label "$(profile_field "$profile" display)")."
   return 1
 }
 
@@ -684,7 +687,7 @@ cmd_set() {
   else
     switch_to "$(jq -c --arg d "$display" '.display = $d' <<<"$profile")" || exit 1
   fi
-  notify "$(label "$display")" "$key"
+  notify "$(label "$display")" "$(display_name "$key")"
 }
 
 cmd_position() {
@@ -946,7 +949,7 @@ cmd_brightness() {
   if [[ $(profile_field "$profile" ddc) == true ]]; then
     ((next < 0)) && next=0
     reply=$(ddc_get "$name") && read -r _ max <<<"$reply"
-    ddc_set "$name" "$((next * ${max:-100} / 100))" || notify "Brightness didn't change" "$key stopped answering."
+    ddc_set "$name" "$((next * ${max:-100} / 100))" || notify "Brightness didn't change" "$(display_name "$key") stopped answering."
   else
     # Dimming below a fifth would leave the room unable to read anything.
     ((next < 20)) && next=20
@@ -987,6 +990,7 @@ cmd_status() {
       connected: ($monitor != null),
       name: ($monitor.name // ""),
       label: $key,
+      displayName: ($key | sub(" 0x[0-9A-Fa-f]+$"; "")),
       resolution: (if $monitor == null then "" else "\($profile.width)x\($profile.height)" end),
       display: ($profile.display // ""),
       position: ($profile.position // "right"),

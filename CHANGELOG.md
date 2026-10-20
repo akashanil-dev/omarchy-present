@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.1.0
 
 - Renamed to Present the Screen. The plugin id, the `present` command and the
   saved settings are unchanged.
@@ -13,7 +13,8 @@
 - Brightness: DDC/CI with ddcutil where the display takes it, otherwise a
   dimming layer, and the picker says which.
 - A bar icon showing the mode: click for the picker, scroll for brightness.
-
+- Upgrading from 1.0.0: disable and enable the plugin once to get the bar
+  icon (see the README).
 - Laptop screen only keeps the projector's signal and shows a card instead: an
   optional title line, your name and site, a QR code, and the time. Set it up
   in `~/.config/io.github.akashanil-dev.present/card.json`, or the title with

@@ -120,7 +120,7 @@ BarWidget {
     dimmed: root.status.display === "ignore"
     tooltipText: !root.status.connected ? "Present the Screen"
       : "Present the Screen · " + (root.modeNames[root.status.display] || "Duplicate")
-        + "\n" + root.status.label
+        + "\n" + (root.status.displayName || root.status.label)
         + (root.activeSound !== "" ? "\nSound: " + root.activeSound : "")
         + "\nBrightness " + (root.status.brightness || 100) + "%"
         + (root.status.brightnessMethod === "dim" ? " (dimmed)" : "")

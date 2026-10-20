@@ -50,8 +50,11 @@ at its largest mode of 50Hz or more instead.
 
 ```bash
 omarchy plugin add https://github.com/akashanil-dev/omarchy-present.git --enable
-sudo pacman -S wl-mirror
+sudo pacman -S wl-mirror            # Duplicate and Match the TV
+sudo pacman -S qrencode ddcutil     # optional: the card's QR code, monitor brightness
 ```
+
+`--enable` asks where in the bar the icon goes; the right section suits it.
 
 Then bind the picker to a key in `~/.config/hypr/bindings.lua`. Present doesn't
 add the binding for you. `SUPER + P` matches Windows; Omarchy uses it for
@@ -62,6 +65,18 @@ hl.unbind("SUPER + P")
 o.bind("SUPER + P", "Project to a second screen", "omarchy-shell shell toggle io.github.akashanil-dev.present")
 ```
 
+### Updating from 1.0.0
+
+```bash
+omarchy plugin update io.github.akashanil-dev.present
+omarchy plugin disable io.github.akashanil-dev.present
+omarchy plugin enable io.github.akashanil-dev.present --section right
+```
+
+1.0.0 had no bar icon, so Omarchy recorded it as a plugin without one;
+disabling and enabling it again puts the new icon in the bar. Your saved
+displays are kept.
+
 ## Using it
 
 `SUPER + P` opens the picker.
@@ -70,27 +85,30 @@ o.bind("SUPER + P", "Project to a second screen", "omarchy-shell shell toggle io
 |---|---|
 | `←` `→`, or `P` | Choose a mode |
 | `Enter` | Apply it |
-| `1`–`4` | Apply a mode directly |
+| `1`–`5` | Apply a mode directly |
 | `+` `−` | Bigger or smaller (Extend and Second screen only) |
 | `0` | Back to the automatic size |
 | `Esc` | Close |
 
-The bottom row sets where an extended display sits and how big things are on
-it. **Don't manage** hands the display back to your own Hyprland config, for a
-desk monitor you have already set up in `monitors.lua`.
+Below the modes: where an extended display sits and how big things are on it,
+which output the sound plays from, and the display's brightness. **Don't
+manage** hands the display back to your own Hyprland config, for a desk monitor
+you have already set up in `monitors.lua`.
 
 Everything is also available from a terminal:
 
 ```bash
 P=~/.config/omarchy/plugins/io.github.akashanil-dev.present/bin/present
 $P status                       # JSON: the display and its saved mode
-$P set duplicate                # duplicate | extend | external | internal | ignore
+$P set duplicate                # duplicate | match | extend | external | internal | ignore
 $P position up                  # right | left | up | down
 $P scale up                     # up | down | reset
 $P title "Back at 3:15"         # top line of the card; no text clears it
 ```
 
 ### Match the TV
+
+![Match the TV: the laptop's desktop takes the TV's shape, and the TV is filled](docs/match.png)
 
 The laptop panel keeps its native resolution (laptop panels take no other), but
 a strip at the top is reserved so the desktop below it has the TV's shape: on a
@@ -139,6 +157,8 @@ move it like any other bar widget.
 
 ### The card
 
+![The card on a TV in Laptop screen only](docs/card.png)
+
 In **Laptop screen only** the projector keeps its signal and shows a card in
 your theme's colours, instead of being switched off. Some TVs drop off HDMI when
 their signal stops and stay gone until power-cycled; this way they never do,
@@ -172,7 +192,7 @@ nothing burns into a TV left on all day.
 - **No config files are edited.** Display rules are applied at runtime with
   `hyprctl eval`, the way Omarchy's own `SUPER + /` scaling key works. A config
   reload drops them, and the plugin applies them again right after.
-- **Duplicate** uses [wl-mirror](https://github.com/Ferdi265/wl-mirror). The
+- **Duplicate and Match the TV** use [wl-mirror](https://github.com/Ferdi265/wl-mirror). The
   external display runs at its native mode, placed far away from the laptop
   display so the cursor and new windows can't land on it, and wl-mirror fills it
   on a workspace of its own (`present`), so `SUPER + 1`–`9` stay on the laptop.
@@ -192,12 +212,14 @@ Files it writes:
 
 | Path | Contents |
 |---|---|
-| `~/.local/state/io.github.akashanil-dev.present/displays.json` | The saved mode, position and size of each display |
+| `~/.local/state/io.github.akashanil-dev.present/displays.json` | Each display's saved mode, position, size, sound output and brightness |
 | `~/.local/state/io.github.akashanil-dev.present/present.log` | What happened and when, trimmed to a few hundred lines |
-| `$XDG_RUNTIME_DIR/io.github.akashanil-dev.present/` | A lock file, the rules applied in this session, and the card's state and QR code |
+| `$XDG_RUNTIME_DIR/io.github.akashanil-dev.present/` | A lock file, the rules applied in this session, what the card and dimming layer show, and the QR code |
+| `~/.local/state/omarchy/toggles/hypr/internal-monitor-disable.lua` | Omarchy's own laptop-screen-off flag, in Second screen only |
 
 It reads `~/.config/io.github.akashanil-dev.present/card.json` (see The card),
-and `present title` writes to it.
+and `present title` writes to it. Choosing a sound output changes the default
+output (and if needed the sound card's profile) through PipeWire.
 
 Nothing runs as root, and nothing reaches the network.
 
@@ -237,7 +259,7 @@ wl-mirror 0.18.5.
 
 ```bash
 omarchy plugin remove io.github.akashanil-dev.present
-rm -rf ~/.local/state/io.github.akashanil-dev.present
+rm -rf ~/.local/state/io.github.akashanil-dev.present ~/.config/io.github.akashanil-dev.present
 hyprctl reload
 ```
 
@@ -246,18 +268,22 @@ drops any display rules Present applied.
 
 ## Development
 
-`bin/present` holds all the logic; `Service.qml` reacts to Hyprland's
-`monitoradded`, `monitorremoved` and `configreloaded` events, and `Picker.qml` is
-the picker. To try it without a second display, create a virtual one and let
-Present count it:
+`bin/present` holds all the logic. `Service.qml` reacts to Hyprland's display
+and fullscreen events and draws the card (`Card.qml`) and the dimming layer;
+`Picker.qml` is the picker and `BarWidget.qml` the bar icon. The shell doesn't
+always pick up an edited `.qml` file on its own; `omarchy-restart-shell` does.
+
+To try it without a second display, create a virtual one with a connector-like
+name, which Present counts like a real display:
 
 ```bash
-touch ~/.local/state/io.github.akashanil-dev.present/include-headless
-hyprctl output create headless HDMI-A-1
+hyprctl output create headless HDMI-A-9
 # ...
-hyprctl output remove HDMI-A-1
-rm ~/.local/state/io.github.akashanil-dev.present/include-headless
+hyprctl output remove HDMI-A-9
 ```
+
+Virtual outputs with other names (`HEADLESS-2`) only count after
+`touch ~/.local/state/io.github.akashanil-dev.present/include-headless`.
 
 ## License
 

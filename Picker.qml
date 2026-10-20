@@ -182,7 +182,7 @@ Item {
           }
           Text {
             text: !root.status.connected ? "No external display connected"
-              : root.status.label + "  ·  " + root.status.resolution
+              : (root.status.displayName || root.status.label) + "  ·  " + root.status.resolution
                 + (root.status.display === "ignore" ? "  ·  left to your Hyprland config" : "")
             color: root.foreground
             opacity: 0.6
@@ -442,7 +442,7 @@ Item {
         Text {
           anchors.centerIn: parent
           visible: parent.on
-          text: diagramRoot.mode === "duplicate" ? "1" : String(index + 1)
+          text: diagramRoot.mode === "duplicate" || diagramRoot.mode === "match" ? "1" : String(index + 1)
           color: root.background
           font.family: root.fontFamily
           font.pixelSize: Style.font.body
