@@ -7,7 +7,7 @@ projector or TV, press `SUPER + P`, pick a mode.
 
 | Mode | What you get |
 |---|---|
-| **1 Laptop screen only** | The external display is turned off. |
+| **1 Laptop screen only** | The external display shows a card: your name, site, a QR code and the time. |
 | **2 Duplicate** | The external shows your laptop screen, scaled to fit with black bars. Nothing is stretched, and neither screen changes resolution. |
 | **3 Extend** | A second desktop to the left, right, above or below. |
 | **4 Second screen only** | The laptop screen is turned off. |
@@ -84,7 +84,38 @@ $P status                       # JSON: the display and its saved mode
 $P set duplicate                # duplicate | extend | external | internal | ignore
 $P position up                  # right | left | up | down
 $P scale up                     # up | down | reset
+$P title "Back at 3:15"         # top line of the card; no text clears it
 ```
+
+### The card
+
+In **Laptop screen only** the projector keeps its signal and shows a card in
+your theme's colours, instead of being switched off. Some TVs drop off HDMI when
+their signal stops and stay gone until power-cycled; this way they never do,
+and switching back is instant. Set it up in
+`~/.config/io.github.akashanil-dev.present/card.json`:
+
+```json
+{
+  "name": "Your Name",
+  "site": "example.dev",
+  "title": "",
+  "clock": true
+}
+```
+
+| Key | Shows |
+|---|---|
+| `title` | A line above your name, for the room: "Back at 3:15", the talk's title |
+| `name` | Your name, large |
+| `site` | Under your name, and as a QR code to `https://` that site |
+| `qr` | A different link for the QR code; `""` for none |
+| `clock` | The time and date in the corner (`false` to hide) |
+
+Changes show up right away. Without a `card.json`, the card is a large clock.
+The QR code needs [`qrencode`](https://archlinux.org/packages/extra/x86_64/qrencode/);
+without it the card has no code. Everything drifts a few pixels each minute, so
+nothing burns into a TV left on all day.
 
 ## How it works
 
@@ -96,9 +127,16 @@ $P scale up                     # up | down | reset
   display so the cursor and new windows can't land on it, and wl-mirror fills it
   on a workspace of its own (`present`), so `SUPER + 1`–`9` stay on the laptop.
   If wl-mirror exits unexpectedly, it is restarted.
-- **The laptop screen** is only turned off through Omarchy's own toggle
-  (`omarchy-hyprland-monitor-internal`), so Omarchy's lid and docking watcher
-  agrees with Present.
+- **The laptop screen** is turned off through Omarchy's own toggle file (the
+  one `omarchy-hyprland-monitor-internal` writes), so Omarchy's lid and docking
+  watcher agrees with Present. It is switched at runtime instead of with a
+  config reload: some TVs answer the extra modeset by dropping off HDMI.
+- **A mode is only saved once it works.** If the display drops out while
+  switching, Present goes back to the previous mode and says so, rather than
+  restoring a broken one at the next plug-in.
+- **Displays are matched by connector** (`HDMI-A-1`, `DP-2`, ...). A TV that
+  comes up without its name (its EDID read failed) keeps the mode last used on
+  that port, and the laptop screen stays on until it reports a usable mode.
 
 Files it writes:
 
@@ -106,7 +144,10 @@ Files it writes:
 |---|---|
 | `~/.local/state/io.github.akashanil-dev.present/displays.json` | The saved mode, position and size of each display |
 | `~/.local/state/io.github.akashanil-dev.present/present.log` | What happened and when, trimmed to a few hundred lines |
-| `$XDG_RUNTIME_DIR/io.github.akashanil-dev.present/` | A lock file and the rules applied in this session |
+| `$XDG_RUNTIME_DIR/io.github.akashanil-dev.present/` | A lock file, the rules applied in this session, and the card's state and QR code |
+
+It reads `~/.config/io.github.akashanil-dev.present/card.json` (see The card),
+and `present title` writes to it.
 
 Nothing runs as root, and nothing reaches the network.
 
@@ -118,6 +159,7 @@ Nothing runs as root, and nothing reaches the network.
   Duplicate, from Arch's `extra` repository. The other modes work without it,
   and the picker says when it is missing.
 - `jq` and `hyprctl`, both part of Omarchy
+- Optional: `qrencode`, for the QR code on the card
 
 Tested on Omarchy 4.0.0 alpha with Hyprland 0.56.2, Quickshell 0.3.1 and
 wl-mirror 0.18.5.
@@ -126,6 +168,11 @@ wl-mirror 0.18.5.
 
 - **Something looks wrong on a projector.** Look at `present.log` (see above)
   and include it in an issue.
+- **The TV isn't detected, or the picker says no display is connected while
+  one is plugged in.** Run `journalctl -k | grep -i hpd`. A line like `HPD
+  interrupt storm detected on connector HDMI-A-1` means the TV flapped its
+  connection and the graphics driver stopped listening to it. Turn the TV off at
+  the wall for ten seconds and plug it back in, or suspend and resume.
 - **"Process crashed: wl-mirror".** wl-mirror can crash when a display is
   reconfigured under it. Present restarts it within about a second, but
   Omarchy's crash watcher still reports the crash. To silence those reports for

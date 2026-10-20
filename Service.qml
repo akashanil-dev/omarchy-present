@@ -19,6 +19,10 @@ Item {
   property bool reloaded: false
   property bool displaysChanged: false
 
+  // The output showing the card in Laptop screen only; bin/present writes it.
+  property string cardOutput: ""
+  readonly property string runtimeDir: (Quickshell.env("XDG_RUNTIME_DIR") || "/tmp") + "/" + pluginId
+
   // Displays need a moment to settle; a config reload only needs Present's
   // runtime rules back quickly, before anyone notices them gone.
   function reconcile() {
@@ -67,6 +71,27 @@ Item {
         root.reconcile()
       }
     }
+  }
+
+  FileView {
+    id: cardState
+    path: root.runtimeDir + "/card.json"
+    watchChanges: true
+    printErrors: false
+    onLoaded: {
+      try { root.cardOutput = JSON.parse(text()).output || "" } catch (e) { root.cardOutput = "" }
+    }
+    // Create it, so there is a file to watch before the first mode change.
+    onLoadFailed: {
+      root.cardOutput = ""
+      setText(JSON.stringify({ output: "" }) + "\n")
+    }
+    onFileChanged: reload()
+  }
+
+  Card {
+    output: root.cardOutput
+    pluginId: root.pluginId
   }
 
   // A shell restart may have missed a config reload, so start from a full apply.

@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+- Laptop screen only keeps the projector's signal and shows a card instead: an
+  optional title line, your name and site, a QR code, and the time. Set it up
+  in `~/.config/io.github.akashanil-dev.present/card.json`, or the title with
+  `present title "..."`.
+- Fix: choosing Laptop screen only, Extend, Second screen only or Don't manage
+  in the picker did nothing. The picker closed itself before running the
+  command, and the shell had already unloaded it.
+- Second screen only turns the laptop display off at runtime instead of with a
+  config reload, which made some TVs drop off HDMI (hotplug storm, EDID lost).
+- A mode is saved only once the display really ended up that way; otherwise
+  the previous mode comes back with a notification.
+- Displays are matched by connector, so a TV that comes up without its EDID
+  still keeps its saved mode, and the laptop stays on while it has no modes.
+
 ## 1.0.0
 
 First release.

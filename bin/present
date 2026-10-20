@@ -9,6 +9,8 @@
 #   present hotplug [--force]           reconcile after a display was added/removed
 #                                       (--force: a config reload also happened)
 #   present reapply                     re-apply after Hyprland reloaded its config
+#   present title [text]                top line of the card shown in Laptop screen
+#                                       only ("Back at 3:15"); no text clears it
 #
 # Duplicate never uses Hyprland's mirror (it stretches unlike aspect ratios).
 # The external runs at its own native mode, parked out of the cursor's reach, and
@@ -16,10 +18,10 @@
 #
 # Rules are applied at runtime with `hyprctl eval`, like Omarchy's own monitor
 # scaling, so no config file is edited. A config reload drops them; the service
-# calls `present reapply` afterwards. The laptop display is only ever turned off
-# through Omarchy's own toggle (omarchy-hyprland-monitor-internal), so Omarchy's
-# clamshell watcher agrees with it and turns the laptop back on if the external
-# goes away.
+# calls `present reapply` afterwards. The laptop display is turned off through
+# Omarchy's own toggle file (the one omarchy-hyprland-monitor-internal writes),
+# so Omarchy's clamshell watcher agrees with it, but at runtime rather than with
+# a config reload, which some TVs answer by dropping off the bus.
 
 set -uo pipefail
 
@@ -30,6 +32,8 @@ DB="$STATE_DIR/displays.json"
 LOG="$STATE_DIR/present.log"
 LOCK="$RUNTIME_DIR/lock"
 APPLIED="$RUNTIME_DIR/applied-${HYPRLAND_INSTANCE_SIGNATURE:-session}"
+CARD_STATE="$RUNTIME_DIR/card.json" # which output shows the card; Service.qml watches it
+CARD_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/$PLUGIN_ID/card.json"
 MIRROR_CLASS=at.yrlf.wl_mirror
 MIRROR_CLASS_RE='^at\\.yrlf\\.wl_mirror$' # as a Lua string
 MIRROR_WORKSPACE="name:present"
@@ -70,18 +74,41 @@ internal_active() {
 
 # Connected external displays, including ones we disabled. FALLBACK is the
 # placeholder Hyprland creates while no real display is up. Virtual outputs
-# (no make or description: streaming, tests) only count with
-# PRESENT_INCLUDE_HEADLESS=1.
+# (HEADLESS-, WAYLAND-, X11-: streaming, nested sessions) only count with
+# PRESENT_INCLUDE_HEADLESS=1. Displays are told apart by connector name, not by
+# make or description: a TV whose EDID read failed after a hotplug storm has
+# neither, and is still the TV on the cable.
 externals() {
   hyprctl monitors all -j | jq -c --arg headless "${PRESENT_INCLUDE_HEADLESS:-0}" '
     [.[] | select(.name | test("^(eDP|LVDS|DSI)-|^FALLBACK$") | not)
-         | select($headless == "1" or ((.name | test("^HEADLESS")) or (.description // "") == "" and (.make // "") == "" | not))]'
+         | select($headless == "1" or (.name | test("^(HEADLESS|WAYLAND|X11)-") | not))]'
 }
 
 # The display the modes apply to: the first external.
 primary() { externals | jq -c '.[0] // empty'; }
 
-display_key() { jq -r 'if (.description // "") != "" then .description else .name end' <<<"$1"; }
+# Hyprland has modes for the display. Without them (EDID never read) nothing
+# can be shown on it, so it must not be the only screen left on.
+usable() { jq -e '.width > 0 or (.availableModes | length) > 0' <<<"$1" >/dev/null; }
+
+# Profiles are saved by description. A display that came up without one (its
+# EDID read failed) gets the profile last used on the same connector instead of
+# a fresh Duplicate one.
+display_key() {
+  jq -r --slurpfile db "$DB" '
+    if (.description // "") != "" then .description
+    else .name as $n
+      | ([$db[0] | to_entries[] | select(.value.output == $n)] | max_by(.value.seen // 0) | .key) // $n
+    end' <<<"$1"
+}
+
+# Remember which connector a display was last seen on, for display_key.
+profile_seen() {
+  local key="$1" name="$2" profile
+  profile=$(profile_get "$key")
+  [[ -n $profile ]] || return 0
+  profile_put "$key" "$(jq -c --arg n "$name" --argjson t "$(date +%s)" '.output = $n | .seen = $t' <<<"$profile")"
+}
 
 profile_get() { jq -c --arg k "$1" '.[$k] // empty' "$DB"; }
 
@@ -200,7 +227,10 @@ render_rules() {
     fi
 
     case $display in
-      internal) printf 'hl.monitor({ output = "%s", disabled = true })\n' "$name" ;;
+      # Parked but still driven: some TVs drop off HDMI when their signal
+      # stops and don't come back until power-cycled. The service covers it
+      # with the card instead.
+      internal) monitor_rule "$name" "$mode" "$FAR_POSITION" "$scale" ;;
       external) monitor_rule "$name" "$mode" auto "$scale" ;;
       extend) monitor_rule "$name" "$mode" "auto-$position" "$scale" ;;
       duplicate)
@@ -212,6 +242,85 @@ render_rules() {
 }
 
 internal_disabled_by_omarchy() { omarchy-hyprland-toggle-enabled internal-monitor-disable; }
+
+# Laptop screen off and on without `hyprctl reload`. A reload re-applies every
+# monitor, and some TVs answer the extra modeset with a hotplug storm that loses
+# their EDID until replugged. Omarchy's toggle file is still written, exactly as
+# omarchy-hyprland-monitor-internal writes it, so its clamshell watcher and
+# login recovery agree, and later config reloads keep the laptop off.
+INTERNAL_TOGGLE="$HOME/.local/state/omarchy/toggles/hypr/internal-monitor-disable.lua"
+INTERNAL_SAVED="$RUNTIME_DIR/internal.json"
+
+internal_off() {
+  local monitor name
+  monitor=$(internal_monitor)
+  [[ -n $monitor ]] || return 1
+  name=$(jq -r '.name' <<<"$monitor")
+  safe_name "$name" || return 1
+  jq -e '.disabled == false' <<<"$monitor" >/dev/null && printf '%s\n' "$monitor" >"$INTERNAL_SAVED"
+  mkdir -p "$(dirname "$INTERNAL_TOGGLE")"
+  printf 'hl.monitor({ output = "%s", disabled = true })\n' "$name" >"$INTERNAL_TOGGLE"
+  hyprctl eval "hl.monitor({ output = \"$name\", disabled = true })" >/dev/null
+}
+
+# Back to the mode and scale it had before internal_off, or the config's own
+# rule when that is unknown (a shell restart in between).
+internal_on() {
+  local name rule=""
+  name=$(internal_name)
+  [[ -n $name ]] && safe_name "$name" || return 1
+  rm -f "$INTERNAL_TOGGLE"
+  [[ -s $INTERNAL_SAVED ]] &&
+    rule=$(jq -r --arg n "$name" 'select(.name == $n and .width > 0)
+      | "hl.monitor({ output = \"\(.name)\", disabled = false, mode = \"\(.width)x\(.height)@\(.refreshRate)\", position = \"0x0\", scale = \(.scale), transform = \(.transform) })"' "$INTERNAL_SAVED")
+  if [[ -n $rule ]]; then
+    hyprctl eval "$rule" >/dev/null
+  else
+    hyprctl reload >/dev/null 2>&1
+  fi
+  rm -f "$INTERNAL_SAVED"
+  hypr 'hl.dsp.dpms({ action = "enable" })'
+}
+
+# Tell the service which output shows the card, "" for none. Written in place,
+# not replaced, so the service's file watch stays on the same file.
+card_output() {
+  local current=""
+  [[ -f $CARD_STATE ]] && current=$(jq -r '.output // ""' "$CARD_STATE" 2>/dev/null)
+  [[ $current == "$1" && -f $CARD_STATE ]] && return 0
+  jq -nc --arg o "$1" '{output: $o}' >"$CARD_STATE"
+}
+
+monitor_by_name() {
+  hyprctl monitors all -j | jq -c --arg n "$1" '.[] | select(.name == $n)'
+}
+
+# The display ended up the way the mode asks for. Second screen only waits and
+# looks again: the TV's hotplug storm comes a second or two after the modeset.
+mode_took() {
+  local display="$1" name="$2" monitor i
+  for ((i = 0; i < 15; i++)); do
+    monitor=$(monitor_by_name "$name")
+    case $display in
+      # Gone or off counts too: Don't manage, or a TV that dropped out anyway.
+      internal) [[ -z $monitor ]] || jq -e '.disabled == true or .x == 20000' <<<"$monitor" >/dev/null && return 0 ;;
+      extend) [[ -n $monitor ]] && usable "$monitor" && jq -e '.disabled == false and .x != 20000' <<<"$monitor" >/dev/null && return 0 ;;
+      duplicate) [[ -n $monitor ]] && usable "$monitor" && jq -e '.disabled == false' <<<"$monitor" >/dev/null &&
+        { ! internal_active || mirror_running_on "$name"; } && return 0 ;;
+      external)
+        if [[ -n $monitor ]] && usable "$monitor" && jq -e '.disabled == false' <<<"$monitor" >/dev/null && ! internal_active; then
+          sleep 2.5
+          monitor=$(monitor_by_name "$name")
+          [[ -n $monitor ]] && usable "$monitor" && jq -e '.disabled == false' <<<"$monitor" >/dev/null && return 0
+          return 1
+        fi
+        ;;
+      *) return 0 ;;
+    esac
+    sleep 0.2
+  done
+  return 1
+}
 
 # wl-mirror runs under `present mirror`, which restarts it if it dies: it can
 # crash when a display disappears under it, and a talk shouldn't go dark.
@@ -321,21 +430,35 @@ apply() {
     display=$(profile_field "$(profile_get "$(display_key "$monitor")")" display)
   fi
 
-  # Laptop screen through Omarchy's own toggle, so its clamshell watcher agrees.
-  # Its "off" reloads the config, which brings the service back here to reapply.
+  # A display Hyprland has no modes for can't show anything: keep the laptop
+  # screen on and wait for it to be replugged.
+  if [[ -n $monitor ]] && ! usable "$monitor"; then
+    log "apply: $name has no modes (EDID not read); laptop screen stays on"
+    [[ $display == external ]] && display=none
+  fi
+
   if [[ $display == external ]]; then
-    if ! internal_disabled_by_omarchy; then
+    if ! internal_disabled_by_omarchy || internal_active; then
       stop_mirror
       rules=$(render_rules)
       while IFS= read -r line; do [[ -n $line ]] && hyprctl eval "$line" >/dev/null; done <<<"$rules"
-      omarchy-hyprland-monitor-internal off >/dev/null 2>&1
+      printf '%s\n' "$rules" >"$APPLIED"
+      card_output ""
+      internal_off
       log "apply display=external output=$name (laptop screen off)"
       return
     fi
   elif internal_disabled_by_omarchy; then
-    omarchy-hyprland-monitor-internal on >/dev/null 2>&1
-    hyprctl reload >/dev/null 2>&1
+    internal_on
+    log "laptop screen back on"
     force=1
+  fi
+
+  if [[ -n $monitor ]] && ! usable "$monitor"; then
+    stop_mirror
+    card_output ""
+    rm -f "$APPLIED"
+    return
   fi
 
   # A reload dropped the mirror's window rule and moved the projector under it.
@@ -352,10 +475,17 @@ apply() {
   fi
 
   if [[ $display == duplicate ]] && internal_active; then
+    card_output ""
     sleep 0.3 # the output needs a moment after a mode change
     start_mirror "$name"
+  elif [[ $display == internal ]]; then
+    stop_mirror
+    card_output "$name"
+    # Keep new windows and SUPER + 1-9 on the laptop, not the parked TV.
+    [[ -n $(internal_name) ]] && hypr "hl.dsp.focus({ monitor = \"$(internal_name)\" })"
   else
     stop_mirror
+    card_output ""
   fi
 }
 
@@ -381,39 +511,61 @@ require_primary() {
     notify "No external display connected"
     exit 1
   fi
+  name=$(jq -r '.name' <<<"$monitor")
+  if ! usable "$monitor"; then
+    notify "$name isn't ready" "It connected without reporting any modes. Unplug it and plug it back in."
+    exit 1
+  fi
   key=$(display_key "$monitor")
   profile=$(profile_get "$key")
   [[ -n $profile ]] || profile=$(new_profile "$monitor")
 }
 
+# Save PROFILE_NEW and apply it, keeping it only if the display really ended up
+# that way. Otherwise the previous profile goes back, so a mode that failed
+# (a TV that dropped out mid-switch) isn't restored at the next plug-in.
+switch_to() {
+  local new="$1" display
+  display=$(profile_field "$new" display)
+  profile_put "$key" "$new"
+  apply
+  mode_took "$display" "$name" && return 0
+
+  log "$display did not take on $name; back to $(profile_field "$profile" display)"
+  profile_put "$key" "$profile"
+  apply 1
+  notify "Couldn't switch to $(label "$display")" "$key dropped out during the change. Kept $(label "$(profile_field "$profile" display)")."
+  return 1
+}
+
 cmd_set() {
-  local display="$1" monitor key profile
+  local display="$1" monitor name key profile
   [[ $display =~ ^(duplicate|extend|external|internal|ignore)$ ]] || { echo "Unknown mode: $display" >&2; exit 1; }
   require_primary
-  profile_put "$key" "$(jq -c --arg d "$display" '.display = $d' <<<"$profile")"
 
   if [[ $display == ignore ]]; then
+    profile_put "$key" "$(jq -c '.display = "ignore"' <<<"$profile")"
     # Drop our runtime rules: the user's own config takes the display back.
     stop_mirror
+    card_output ""
     internal_disabled_by_omarchy && omarchy-hyprland-monitor-internal on >/dev/null 2>&1
     rm -f "$APPLIED"
     hyprctl reload >/dev/null 2>&1
   else
-    apply
+    switch_to "$(jq -c --arg d "$display" '.display = $d' <<<"$profile")" || exit 1
   fi
-  [[ $display == external ]] || notify "$(label "$display")" "$key"
+  notify "$(label "$display")" "$key"
 }
 
 cmd_position() {
-  local direction="$1" monitor key profile
+  local direction="$1" monitor name key profile
   [[ $direction =~ ^(right|left|up|down)$ ]] || { echo "Unknown direction: $direction" >&2; exit 1; }
   require_primary
-  profile_put "$key" "$(jq -c --arg p "$direction" '.position = $p | .display = "extend"' <<<"$profile")"
-  apply
+  switch_to "$(jq -c --arg p "$direction" '.position = $p | .display = "extend"' <<<"$profile")" || exit 1
 }
 
 cmd_scale() {
-  local step="$1" monitor key profile current width height next i
+  local step="$1" monitor name key profile current width height next i
   require_primary
   current=$(profile_field "$profile" scale)
   width=$(profile_field "$profile" width)
@@ -451,6 +603,7 @@ cmd_hotplug() {
 
   if [[ -z $monitor ]]; then
     stop_mirror
+    card_output ""
     rm -f "$APPLIED"
     # Unplugged in Second screen only: turn the laptop back on ourselves.
     # Omarchy's own recover counts Hyprland's FALLBACK output as an external and
@@ -458,26 +611,47 @@ cmd_hotplug() {
     if internal_disabled_by_omarchy; then
       omarchy-hyprland-monitor-internal on >/dev/null 2>&1
       hyprctl reload >/dev/null 2>&1
+      rm -f "$INTERNAL_SAVED"
       log "external gone: laptop screen back on"
     fi
+    return
+  fi
+
+  # No modes yet: nothing to profile. apply keeps the laptop screen on.
+  if ! usable "$monitor"; then
+    apply "$force"
     return
   fi
 
   key=$(display_key "$monitor")
   if [[ -z $(profile_get "$key") ]]; then
     profile_put "$key" "$(new_profile "$monitor")"
+    profile_seen "$key" "$(jq -r '.name' <<<"$monitor")"
     apply "$force"
     echo "new"
     return
   fi
 
+  profile_seen "$key" "$(jq -r '.name' <<<"$monitor")"
   apply "$force"
   echo "known"
+}
+
+# The card's settings live in CARD_CONFIG (name, site, qr, title, clock); see
+# the README. Written in place so the card's file watch keeps working.
+cmd_title() {
+  local text="$*" current
+  mkdir -p "$(dirname "$CARD_CONFIG")"
+  current='{}'
+  [[ -s $CARD_CONFIG ]] && current=$(jq -c . "$CARD_CONFIG" 2>/dev/null || echo '{}')
+  jq --arg t "$text" '.title = $t' <<<"$current" >"$CARD_CONFIG"
 }
 
 cmd_status() {
   local monitor key="" profile="null"
   monitor=$(primary)
+  # A display without modes can't take any mode yet; the picker shows none.
+  [[ -n $monitor ]] && ! usable "$monitor" && monitor=""
   if [[ -n $monitor ]]; then
     key=$(display_key "$monitor")
     profile=$(profile_get "$key")
@@ -508,6 +682,7 @@ case "${1:-}" in
   scale) with_lock cmd_scale "${2:-}" ;;
   hotplug) with_lock cmd_hotplug "${2:-}" ;;
   reapply) with_lock apply 1 ;;
+  title) shift; cmd_title "$@" ;;
   mirror) cmd_mirror "${2:-}" "${3:-}" ;;
-  *) sed -n '3,11p' "$0"; exit 1 ;;
+  *) sed -n '3,13p' "$0"; exit 1 ;;
 esac

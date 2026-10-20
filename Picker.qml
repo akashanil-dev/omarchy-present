@@ -22,7 +22,7 @@ Item {
   property int selectedIndex: 1
 
   readonly property var modes: [
-    { id: "internal", title: "Laptop screen only", hint: "Projector off" },
+    { id: "internal", title: "Laptop screen only", hint: "Name card on the projector" },
     { id: "duplicate", title: "Duplicate", hint: "Same picture, no stretching" },
     { id: "extend", title: "Extend", hint: "Second desktop" },
     { id: "external", title: "Second screen only", hint: "Laptop screen off" }
@@ -86,8 +86,10 @@ Item {
     if (!status.connected) return
     var mode = modes[index].id
     if (mode === "duplicate" && !status.mirrorAvailable) return
+    // Launch first: dismiss() makes the shell unload this overlay, and nothing
+    // on it can run afterwards.
+    root.run(["set", mode])
     root.dismiss()
-    run(["set", mode])
   }
 
   // Position and size apply right away and keep the picker open.
@@ -306,8 +308,8 @@ Item {
             label: "Don't manage"
             active: root.status.display === "ignore"
             onClicked: {
-              root.dismiss()
               root.run(["set", "ignore"])
+              root.dismiss()
             }
           }
         }
