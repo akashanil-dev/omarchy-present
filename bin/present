@@ -1,0 +1,513 @@
+#!/bin/bash
+
+# present: Windows-style (Win+P) display modes for Omarchy.
+#
+#   present status                      JSON state for the picker
+#   present set <mode>                  duplicate | extend | external | internal | ignore
+#   present position <dir>              extend direction: right | left | up | down
+#   present scale <up|down|reset>       external display scale
+#   present hotplug [--force]           reconcile after a display was added/removed
+#                                       (--force: a config reload also happened)
+#   present reapply                     re-apply after Hyprland reloaded its config
+#
+# Duplicate never uses Hyprland's mirror (it stretches unlike aspect ratios).
+# The external runs at its own native mode, parked out of the cursor's reach, and
+# wl-mirror shows the laptop screen on it scaled to fit with black bars.
+#
+# Rules are applied at runtime with `hyprctl eval`, like Omarchy's own monitor
+# scaling, so no config file is edited. A config reload drops them; the service
+# calls `present reapply` afterwards. The laptop display is only ever turned off
+# through Omarchy's own toggle (omarchy-hyprland-monitor-internal), so Omarchy's
+# clamshell watcher agrees with it and turns the laptop back on if the external
+# goes away.
+
+set -uo pipefail
+
+PLUGIN_ID="io.github.akashanil-dev.present"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/$PLUGIN_ID"
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}/$PLUGIN_ID"
+DB="$STATE_DIR/displays.json"
+LOG="$STATE_DIR/present.log"
+LOCK="$RUNTIME_DIR/lock"
+APPLIED="$RUNTIME_DIR/applied-${HYPRLAND_INSTANCE_SIGNATURE:-session}"
+MIRROR_CLASS=at.yrlf.wl_mirror
+MIRROR_CLASS_RE='^at\\.yrlf\\.wl_mirror$' # as a Lua string
+MIRROR_WORKSPACE="name:present"
+FAR_POSITION="20000x20000" # out of the cursor's reach, so nothing lands there
+MIN_HZ=49
+SCALES=(1 1.2 1.25 1.33 1.5 1.6 2 2.4 2.5 3)
+
+mkdir -p "$STATE_DIR" "$RUNTIME_DIR"
+[[ -s $DB ]] || echo '{}' >"$DB"
+
+# Tests create a headless output; touching this file makes it count everywhere.
+[[ -f $STATE_DIR/include-headless ]] && PRESENT_INCLUDE_HEADLESS=1
+
+# Keep the last few hundred lines; enough to see what happened at a talk.
+log() {
+  printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$LOG"
+  (($(wc -l <"$LOG") > 500)) && tail -n 300 "$LOG" >"$LOG.tmp" && mv "$LOG.tmp" "$LOG"
+  return 0
+}
+
+notify() { omarchy-notification-send -g 󰍹 "$@" >/dev/null 2>&1 || true; }
+
+safe_name() { [[ $1 =~ ^[A-Za-z0-9._-]+$ ]]; }
+
+hypr() { hyprctl dispatch "$1" >/dev/null 2>&1; }
+
+internal_name() { omarchy-hyprland-monitor-laptop; }
+
+internal_monitor() {
+  hyprctl monitors all -j | jq -c '[.[] | select(.name | test("^(eDP|LVDS|DSI)-"))][0] // empty'
+}
+
+# The laptop screen is on. It is off with the lid closed (Omarchy's clamshell)
+# or in Second screen only, and then there is nothing to mirror.
+internal_active() {
+  hyprctl monitors all -j | jq -e '.[] | select(.name | test("^(eDP|LVDS|DSI)-")) | select(.disabled == false)' >/dev/null
+}
+
+# Connected external displays, including ones we disabled. FALLBACK is the
+# placeholder Hyprland creates while no real display is up. Virtual outputs
+# (no make or description: streaming, tests) only count with
+# PRESENT_INCLUDE_HEADLESS=1.
+externals() {
+  hyprctl monitors all -j | jq -c --arg headless "${PRESENT_INCLUDE_HEADLESS:-0}" '
+    [.[] | select(.name | test("^(eDP|LVDS|DSI)-|^FALLBACK$") | not)
+         | select($headless == "1" or ((.name | test("^HEADLESS")) or (.description // "") == "" and (.make // "") == "" | not))]'
+}
+
+# The display the modes apply to: the first external.
+primary() { externals | jq -c '.[0] // empty'; }
+
+display_key() { jq -r 'if (.description // "") != "" then .description else .name end' <<<"$1"; }
+
+profile_get() { jq -c --arg k "$1" '.[$k] // empty' "$DB"; }
+
+profile_put() {
+  local tmp
+  tmp=$(mktemp "$STATE_DIR/db.XXXXXX")
+  jq --arg k "$1" --argjson p "$2" '.[$k] = $p' "$DB" >"$tmp" && mv "$tmp" "$DB"
+}
+
+profile_field() { jq -r --arg f "$2" '.[$f]' <<<"$1"; }
+
+# Hyprland only accepts scales that divide the mode into whole logical pixels
+# (in 1/120 steps). Round up to the nearest clean value, like Omarchy does.
+clean_scale() {
+  awk -v scale="$1" -v width="$2" -v height="$3" '
+    function gcd(a, b, t) { while (b) { t = a % b; a = b; b = t } return a }
+    BEGIN {
+      g = gcd(width * 120, height * 120)
+      k = int(scale * 120 + 0.5)
+      if (k < 120) k = 120
+      if (k > g) k = g
+      while (g % k != 0) k++
+      printf "%g\n", k / 120
+    }'
+}
+
+# The mode to drive a display at: its native (preferred) mode, unless that is a
+# low-refresh one such as a TV's 4K@30, then the largest mode at 50Hz or more.
+pick_mode() {
+  jq -r --argjson min "$MIN_HZ" '
+    if .disabled != true and .refreshRate >= $min then "preferred"
+    else
+      ([.availableModes[]
+        | capture("^(?<w>[0-9]+)x(?<h>[0-9]+)@(?<r>[0-9.]+)")
+        | {w: (.w | tonumber), h: (.h | tonumber), r: (.r | tonumber)}
+        | select(.r >= $min)]
+       | max_by([.w * .h, .r])
+       | if . == null then "preferred" else "\(.w)x\(.h)@\(.r)" end)
+    end' <<<"$1"
+}
+
+# Pixel size the chosen mode gives.
+mode_size() {
+  local monitor="$1" mode="$2"
+  if [[ $mode == preferred ]]; then
+    jq -r 'if .disabled != true and .width > 0 then "\(.width) \(.height)"
+           else (.availableModes[0] | capture("^(?<w>[0-9]+)x(?<h>[0-9]+)") | "\(.w) \(.h)") end' <<<"$monitor"
+  else
+    [[ $mode =~ ^([0-9]+)x([0-9]+) ]] && echo "${BASH_REMATCH[1]} ${BASH_REMATCH[2]}"
+  fi
+}
+
+# Scale that makes any display look like a 1080p one: readable on TVs and
+# projectors whatever their size, unlike Hyprland's PPI-based "auto".
+auto_scale() {
+  clean_scale "$(awk -v h="$2" 'BEGIN { s = h / 1080; printf "%.4f", (s < 1 ? 1 : s) }')" "$1" "$2"
+}
+
+# Profile for a display seen for the first time: Duplicate, like plugging a
+# projector into Windows.
+new_profile() {
+  local monitor="$1" mode w h
+  mode=$(pick_mode "$monitor")
+  read -r w h <<<"$(mode_size "$monitor" "$mode")"
+  jq -nc --arg mode "$mode" --argjson scale "$(auto_scale "$w" "$h")" --argjson w "$w" --argjson h "$h" \
+    '{display: "duplicate", position: "right", mode: $mode, scale: $scale, autoScale: $scale, width: $w, height: $h}'
+}
+
+monitor_rule() {
+  # disabled = false: a runtime rule only turns a display back on when it says so.
+  printf 'hl.monitor({ output = "%s", disabled = false, mode = "%s", position = "%s", scale = %s })\n' "$1" "$2" "$3" "$4"
+}
+
+# Pin the laptop display at the origin with whatever mode and scale the user's
+# config gave it, so parking or placing an external never moves it.
+internal_pin_rule() {
+  local monitor name
+  monitor=$(internal_monitor)
+  [[ -n $monitor ]] || return 0
+  jq -e '.disabled == false' <<<"$monitor" >/dev/null || return 0
+  name=$(jq -r '.name' <<<"$monitor")
+  safe_name "$name" || return 0
+  jq -r '"hl.monitor({ output = \"\(.name)\", mode = \"\(.width)x\(.height)@\(.refreshRate)\", position = \"0x0\", scale = \(.scale), transform = \(.transform) })"' <<<"$monitor"
+}
+
+# The rules for every connected external, from its saved profile.
+render_rules() {
+  local list count i monitor name key profile display mode scale position pinned=0
+  list=$(externals)
+  count=$(jq 'length' <<<"$list")
+
+  for ((i = 0; i < count; i++)); do
+    monitor=$(jq -c ".[$i]" <<<"$list")
+    name=$(jq -r '.name' <<<"$monitor")
+    safe_name "$name" || continue
+    key=$(display_key "$monitor")
+    profile=$(profile_get "$key")
+    [[ -n $profile ]] || continue
+
+    display=$(profile_field "$profile" display)
+    mode=$(profile_field "$profile" mode)
+    scale=$(profile_field "$profile" scale)
+    position=$(profile_field "$profile" position)
+    [[ $display == ignore ]] && continue
+    [[ $mode =~ ^(preferred|[0-9]+x[0-9]+@[0-9.]+)$ && $scale =~ ^[0-9.]+$ && $position =~ ^(right|left|up|down)$ ]] || continue
+
+    # Only the first external follows the chosen mode; others extend. With the
+    # laptop screen off there is nothing to duplicate, so the external becomes
+    # the main screen until it comes back.
+    ((i > 0)) && display=extend
+    [[ $display == duplicate ]] && ! internal_active && display=external
+
+    if ((!pinned)); then
+      internal_pin_rule
+      pinned=1
+    fi
+
+    case $display in
+      internal) printf 'hl.monitor({ output = "%s", disabled = true })\n' "$name" ;;
+      external) monitor_rule "$name" "$mode" auto "$scale" ;;
+      extend) monitor_rule "$name" "$mode" "auto-$position" "$scale" ;;
+      duplicate)
+        monitor_rule "$name" "$mode" "$FAR_POSITION" "$scale"
+        printf 'hl.window_rule({ match = { class = "%s" }, fullscreen = true, no_initial_focus = true, no_focus = true, no_anim = true, border_size = 0, idle_inhibit = "always" })\n' "$MIRROR_CLASS_RE"
+        ;;
+    esac
+  done
+}
+
+internal_disabled_by_omarchy() { omarchy-hyprland-toggle-enabled internal-monitor-disable; }
+
+# wl-mirror runs under `present mirror`, which restarts it if it dies: it can
+# crash when a display disappears under it, and a talk shouldn't go dark.
+mirror_running_on() { pgrep -f "[/]present mirror $1 " >/dev/null; }
+
+stop_mirror() {
+  pkill -f '[/]present mirror ' 2>/dev/null
+  pkill -f '^[w]l-mirror --fullscreen-output ' 2>/dev/null
+  return 0
+}
+
+# Duplicate is still what the session wants on this display.
+mirror_wanted() {
+  local target="$1" monitor
+  monitor=$(primary)
+  [[ -n $monitor && $(jq -r '.name' <<<"$monitor") == "$target" ]] || return 1
+  [[ $(profile_field "$(profile_get "$(display_key "$monitor")")" display) == duplicate ]] || return 1
+  internal_active
+}
+
+cmd_mirror() {
+  local target="$1" source="$2" started status restarts=0 window_start=$SECONDS
+  safe_name "$target" && safe_name "$source" || exit 1
+  while true; do
+    started=$SECONDS
+    wl-mirror --fullscreen-output "$target" "$source" >/dev/null 2>&1 </dev/null
+    status=$?
+    mirror_wanted "$target" || break
+
+    # Give up on a crash loop rather than flashing the projector forever.
+    ((SECONDS - window_start > 60)) && { restarts=0; window_start=$SECONDS; }
+    if ((++restarts > 5)); then
+      log "wl-mirror keeps exiting ($status); giving up"
+      notify "Duplicate stopped" "wl-mirror keeps exiting. Choose Duplicate again with SUPER + P."
+      break
+    fi
+    log "wl-mirror exited ($status); restarting"
+    ((SECONDS - started < 2)) && sleep 1
+    # Settle twice: the display may still be changing when it comes back.
+    (sleep 0.5; settle_mirror "$target" "$source"; sleep 1.5; settle_mirror "$target" "$source") &
+  done
+}
+
+mirror_window() {
+  hyprctl clients -j | jq -c --arg class "$MIRROR_CLASS" '[.[] | select(.class == $class)][0] // empty'
+}
+
+start_mirror() {
+  local target="$1" source
+  source=$(internal_name)
+  [[ -n $source ]] && safe_name "$source" || return 1
+
+  if ! command -v wl-mirror >/dev/null; then
+    notify "Duplicate needs wl-mirror" "Install it with: sudo pacman -S wl-mirror"
+    return 1
+  fi
+
+  if ! mirror_running_on "$target"; then
+    stop_mirror
+    # A new output takes the first free workspace (often 1). Open the mirror on
+    # its own workspace on the projector instead, so SUPER + 1-9 stay on the laptop.
+    hypr "hl.dsp.focus({ monitor = \"$target\" })"
+    hypr "hl.dsp.focus({ workspace = \"$MIRROR_WORKSPACE\" })"
+    # 9>&- : the mirror outlives this script and must not hold its lock.
+    setsid -f "$(readlink -f "$0")" mirror "$target" "$source" >/dev/null 2>&1 </dev/null 9>&-
+  fi
+  settle_mirror "$target" "$source"
+}
+
+# Make sure the mirror sits on its workspace, then give focus back to the
+# laptop: wl-mirror's fullscreen request focuses the projector otherwise, and
+# new windows and SUPER + 1-9 would land on a screen you can't see.
+settle_mirror() {
+  local target="$1" source="$2" window="" address workspace i
+  for ((i = 0; i < 30; i++)); do
+    window=$(mirror_window)
+    [[ -n $window ]] && break
+    sleep 0.1
+  done
+
+  if [[ -n $window ]]; then
+    address=$(jq -r '.address' <<<"$window")
+    workspace=$(jq -r '.workspace.name' <<<"$window")
+    if [[ $address =~ ^0x[0-9a-f]+$ && $workspace != "${MIRROR_WORKSPACE#name:}" ]]; then
+      hypr "hl.dsp.focus({ monitor = \"$target\" })"
+      hypr "hl.dsp.focus({ workspace = \"$MIRROR_WORKSPACE\" })"
+      hypr "hl.dsp.window.move({ window = \"address:$address\", workspace = \"$MIRROR_WORKSPACE\", follow = false })"
+    fi
+    # Fullscreen covers the projector's own bar and notifications. wl-mirror asks
+    # for it, but not every time it lands; "set" is safe to repeat.
+    [[ $address =~ ^0x[0-9a-f]+$ ]] &&
+      hypr "hl.dsp.window.fullscreen({ window = \"address:$address\", mode = \"fullscreen\", action = \"set\" })"
+  else
+    log "mirror window did not appear"
+  fi
+  hypr "hl.dsp.focus({ monitor = \"$source\" })"
+}
+
+# Bring the session in line with the saved profiles. Rules are evaluated only
+# when they changed (or after a config reload dropped them), so repeated
+# hotplug events settle instead of flickering.
+apply() {
+  local force="${1:-0}" monitor display="none" name="" rules line
+  monitor=$(primary)
+  if [[ -n $monitor ]]; then
+    name=$(jq -r '.name' <<<"$monitor")
+    display=$(profile_field "$(profile_get "$(display_key "$monitor")")" display)
+  fi
+
+  # Laptop screen through Omarchy's own toggle, so its clamshell watcher agrees.
+  # Its "off" reloads the config, which brings the service back here to reapply.
+  if [[ $display == external ]]; then
+    if ! internal_disabled_by_omarchy; then
+      stop_mirror
+      rules=$(render_rules)
+      while IFS= read -r line; do [[ -n $line ]] && hyprctl eval "$line" >/dev/null; done <<<"$rules"
+      omarchy-hyprland-monitor-internal off >/dev/null 2>&1
+      log "apply display=external output=$name (laptop screen off)"
+      return
+    fi
+  elif internal_disabled_by_omarchy; then
+    omarchy-hyprland-monitor-internal on >/dev/null 2>&1
+    hyprctl reload >/dev/null 2>&1
+    force=1
+  fi
+
+  # A reload dropped the mirror's window rule and moved the projector under it.
+  # Start it fresh once the rules are back, rather than leave it half set up.
+  ((force)) && [[ $display == duplicate ]] && stop_mirror
+
+  rules=$(render_rules)
+  if ((force)) || [[ ! -f $APPLIED || $(<"$APPLIED") != "$rules" ]]; then
+    log "apply display=$display output=${name:-none}$( ((force)) && echo " (after reload)")"
+    while IFS= read -r line; do
+      [[ -n $line ]] && hyprctl eval "$line" >/dev/null
+    done <<<"$rules"
+    printf '%s\n' "$rules" >"$APPLIED"
+  fi
+
+  if [[ $display == duplicate ]] && internal_active; then
+    sleep 0.3 # the output needs a moment after a mode change
+    start_mirror "$name"
+  else
+    stop_mirror
+  fi
+}
+
+with_lock() {
+  exec 9>"$LOCK"
+  flock -w 10 9 || exit 1
+  "$@"
+}
+
+label() {
+  case $1 in
+    duplicate) echo "Duplicate" ;;
+    extend) echo "Extend" ;;
+    external) echo "Second screen only" ;;
+    internal) echo "Laptop screen only" ;;
+    ignore) echo "Left to your Hyprland config" ;;
+  esac
+}
+
+require_primary() {
+  monitor=$(primary)
+  if [[ -z $monitor ]]; then
+    notify "No external display connected"
+    exit 1
+  fi
+  key=$(display_key "$monitor")
+  profile=$(profile_get "$key")
+  [[ -n $profile ]] || profile=$(new_profile "$monitor")
+}
+
+cmd_set() {
+  local display="$1" monitor key profile
+  [[ $display =~ ^(duplicate|extend|external|internal|ignore)$ ]] || { echo "Unknown mode: $display" >&2; exit 1; }
+  require_primary
+  profile_put "$key" "$(jq -c --arg d "$display" '.display = $d' <<<"$profile")"
+
+  if [[ $display == ignore ]]; then
+    # Drop our runtime rules: the user's own config takes the display back.
+    stop_mirror
+    internal_disabled_by_omarchy && omarchy-hyprland-monitor-internal on >/dev/null 2>&1
+    rm -f "$APPLIED"
+    hyprctl reload >/dev/null 2>&1
+  else
+    apply
+  fi
+  [[ $display == external ]] || notify "$(label "$display")" "$key"
+}
+
+cmd_position() {
+  local direction="$1" monitor key profile
+  [[ $direction =~ ^(right|left|up|down)$ ]] || { echo "Unknown direction: $direction" >&2; exit 1; }
+  require_primary
+  profile_put "$key" "$(jq -c --arg p "$direction" '.position = $p | .display = "extend"' <<<"$profile")"
+  apply
+}
+
+cmd_scale() {
+  local step="$1" monitor key profile current width height next i
+  require_primary
+  current=$(profile_field "$profile" scale)
+  width=$(profile_field "$profile" width)
+  height=$(profile_field "$profile" height)
+
+  case $step in
+    reset) next=$(profile_field "$profile" autoScale) ;;
+    up | down)
+      next=$current
+      if [[ $step == up ]]; then
+        for i in "${SCALES[@]}"; do
+          awk -v a="$i" -v b="$current" 'BEGIN { exit !(a > b + 0.01) }' && { next=$i; break; }
+        done
+      else
+        for ((i = ${#SCALES[@]} - 1; i >= 0; i--)); do
+          awk -v a="${SCALES[i]}" -v b="$current" 'BEGIN { exit !(a < b - 0.01) }' && { next=${SCALES[i]}; break; }
+        done
+      fi
+      next=$(clean_scale "$next" "$width" "$height")
+      ;;
+    *) echo "Usage: present scale <up|down|reset>" >&2; exit 1 ;;
+  esac
+
+  profile_put "$key" "$(jq -c --argjson s "$next" '.scale = $s' <<<"$profile")"
+  apply
+}
+
+# After a display is added or removed: give new displays a profile, apply, and
+# print "new" when the picker should open.
+cmd_hotplug() {
+  local force=0 monitor key
+  [[ ${1:-} == --force ]] && force=1
+  monitor=$(primary)
+  log "hotplug externals=$(externals | jq -r 'map(.name) | join(",")')"
+
+  if [[ -z $monitor ]]; then
+    stop_mirror
+    rm -f "$APPLIED"
+    # Unplugged in Second screen only: turn the laptop back on ourselves.
+    # Omarchy's own recover counts Hyprland's FALLBACK output as an external and
+    # would leave the session with no screen.
+    if internal_disabled_by_omarchy; then
+      omarchy-hyprland-monitor-internal on >/dev/null 2>&1
+      hyprctl reload >/dev/null 2>&1
+      log "external gone: laptop screen back on"
+    fi
+    return
+  fi
+
+  key=$(display_key "$monitor")
+  if [[ -z $(profile_get "$key") ]]; then
+    profile_put "$key" "$(new_profile "$monitor")"
+    apply "$force"
+    echo "new"
+    return
+  fi
+
+  apply "$force"
+  echo "known"
+}
+
+cmd_status() {
+  local monitor key="" profile="null"
+  monitor=$(primary)
+  if [[ -n $monitor ]]; then
+    key=$(display_key "$monitor")
+    profile=$(profile_get "$key")
+    [[ -n $profile ]] || profile=$(new_profile "$monitor")
+  fi
+
+  jq -nc \
+    --argjson monitor "${monitor:-null}" \
+    --argjson profile "$profile" \
+    --arg key "$key" \
+    --argjson mirror "$(command -v wl-mirror >/dev/null && echo true || echo false)" \
+    '{
+      connected: ($monitor != null),
+      name: ($monitor.name // ""),
+      label: $key,
+      resolution: (if $monitor == null then "" else "\($profile.width)x\($profile.height)" end),
+      display: ($profile.display // ""),
+      position: ($profile.position // "right"),
+      scale: ($profile.scale // 1),
+      mirrorAvailable: $mirror
+    }'
+}
+
+case "${1:-}" in
+  status) cmd_status ;;
+  set) with_lock cmd_set "${2:-}" ;;
+  position) with_lock cmd_position "${2:-}" ;;
+  scale) with_lock cmd_scale "${2:-}" ;;
+  hotplug) with_lock cmd_hotplug "${2:-}" ;;
+  reapply) with_lock apply 1 ;;
+  mirror) cmd_mirror "${2:-}" "${3:-}" ;;
+  *) sed -n '3,11p' "$0"; exit 1 ;;
+esac

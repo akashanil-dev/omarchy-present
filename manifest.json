@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.akashanil-dev.present",
+  "name": "Present",
+  "version": "1.0.0",
+  "author": "Akash A",
+  "license": "MIT",
+  "description": "Windows-style projector modes (SUPER + P): Duplicate without stretching, Extend, laptop or second screen only, with readable scaling on any TV or projector.",
+  "kinds": [
+    "service",
+    "overlay"
+  ],
+  "entryPoints": {
+    "service": "Service.qml",
+    "overlay": "Picker.qml"
+  }
+}
