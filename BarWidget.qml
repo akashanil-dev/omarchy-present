@@ -28,14 +28,6 @@ BarWidget {
     ignore: "Not managed"
   })
 
-  readonly property string icon: {
-    switch (status.display) {
-      case "internal": return "󰌢"
-      case "external": return "󰍹"
-      case "ignore": return "󰍹"
-      default: return "󰍺"
-    }
-  }
 
   readonly property string activeSound: {
     var outputs = status.audio || []
@@ -116,7 +108,12 @@ BarWidget {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: root.icon
+    // Drawn below rather than a font glyph: Nerd Fonts has no monitor with a
+    // plus, and a plain monitor reads as Omarchy's own display widget.
+    text: ""
+    hasVisualContent: true
+    labelVisible: false
+    fixedWidth: vertical ? -1 : icon.width + scaledHorizontalMargin * 2
     dimmed: root.status.display === "ignore"
     tooltipText: !root.status.connected ? "Present the Screen"
       : "Present the Screen · " + (root.modeNames[root.status.display] || "Duplicate")
@@ -132,6 +129,53 @@ BarWidget {
       if (actionProc.running) return
       actionProc.command = [root.cli, "brightness", delta > 0 ? "up" : "down"]
       actionProc.running = true
+    }
+
+    // A monitor outline with a "+" in its screen.
+    Item {
+      id: icon
+      readonly property real stroke: Math.max(1.5, Math.round(button.fontSize * 0.11 * 2) / 2)
+      readonly property color ink: button.foreground
+      anchors.centerIn: parent
+      width: Math.round(button.fontSize * 1.2)
+      height: Math.round(button.fontSize * 1.0)
+
+      Rectangle {
+        id: screen
+        width: parent.width
+        height: Math.round(parent.height * 0.74)
+        radius: icon.stroke
+        color: "transparent"
+        border.width: icon.stroke
+        border.color: icon.ink
+      }
+      Rectangle { // neck
+        anchors.horizontalCenter: parent.horizontalCenter
+        anchors.top: screen.bottom
+        width: icon.stroke
+        height: parent.height - screen.height - icon.stroke
+        color: icon.ink
+      }
+      Rectangle { // foot
+        anchors.horizontalCenter: parent.horizontalCenter
+        anchors.bottom: parent.bottom
+        width: Math.round(parent.width * 0.5)
+        height: icon.stroke
+        radius: height / 2
+        color: icon.ink
+      }
+      Rectangle { // plus, across
+        anchors.centerIn: screen
+        width: Math.round(screen.height * 0.5)
+        height: icon.stroke
+        color: icon.ink
+      }
+      Rectangle { // plus, down
+        anchors.centerIn: screen
+        width: icon.stroke
+        height: Math.round(screen.height * 0.5)
+        color: icon.ink
+      }
     }
   }
 }

@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.1.1
+
+- The bar icon is a monitor with a "+" in its screen, so it isn't mistaken
+  for Omarchy's own display widget.
+
 ## 1.1.0
 
 - Renamed to Present the Screen. The plugin id, the `present` command and the
