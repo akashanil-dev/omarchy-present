@@ -17,6 +17,16 @@ Item {
   readonly property string pluginId: (manifest && manifest.id) || "io.github.akashanil-dev.present"
   readonly property string cli: String(Qt.resolvedUrl("bin/present")).replace(/^file:\/\//, "")
 
+  // The picker belongs on the laptop screen: SUPER + P should open where you
+  // are looking, not on the TV you are about to configure. With the laptop
+  // panel off (Second screen only) it falls back to whatever screen is left.
+  readonly property var pickerScreen: {
+    var screens = Quickshell.screens || []
+    for (var i = 0; i < screens.length; i++)
+      if (/^(eDP|LVDS|DSI)-/.test(screens[i].name)) return screens[i]
+    return screens.length > 0 ? screens[0] : null
+  }
+
   property bool opened: false
   property var status: ({ connected: false })
   property int selectedIndex: 1
@@ -79,6 +89,15 @@ Item {
     selectedIndex = (selectedIndex + delta + modes.length) % modes.length
   }
 
+  function rateLabel(rate) {
+    var n = Math.round(Number(rate) * 100) / 100
+    return n + " Hz"
+  }
+
+  function sameRate(a, b) {
+    return Math.abs(Number(a) - Number(b)) < 0.6
+  }
+
   function run(args) {
     Quickshell.execDetached([root.cli].concat(args))
   }
@@ -123,6 +142,7 @@ Item {
   PanelWindow {
     id: panel
     visible: root.opened
+    screen: root.pickerScreen
     anchors { top: true; bottom: true; left: true; right: true }
     color: "transparent"
     WlrLayershell.namespace: "omarchy-present"
@@ -160,6 +180,8 @@ Item {
           else if (k === Qt.Key_Equal || k === Qt.Key_Plus) root.adjust(["scale", "up"])
           else if (k === Qt.Key_Minus) root.adjust(["scale", "down"])
           else if (k === Qt.Key_0) root.adjust(["scale", "reset"])
+          else if (k === Qt.Key_BracketRight) root.adjust(["fps", "up"])
+          else if (k === Qt.Key_BracketLeft) root.adjust(["fps", "down"])
           else return
           event.accepted = true
         }
@@ -185,6 +207,7 @@ Item {
             textFormat: Text.PlainText
             text: !root.status.connected ? "No external display connected"
               : (root.status.displayName || root.status.label) + "  ·  " + root.status.resolution
+                + "  ·  " + root.rateLabel(root.status.fps || 0)
                 + (root.status.display === "ignore" ? "  ·  left to your Hyprland config" : "")
             color: root.foreground
             opacity: 0.6
@@ -261,36 +284,42 @@ Item {
           }
         }
 
-        // Extend: where the second screen sits. Its text size applies to
-        // Extend and Second screen only.
-        Row {
+        // The external display itself: refresh rate, text size, and where an
+        // extended desktop sits. Refresh rate and size apply at once and keep
+        // the picker open.
+        Column {
           visible: root.status.connected
-          spacing: Style.spacing.xxl
+          spacing: Style.spacing.md
 
           Row {
             spacing: Style.spacing.sm
             Text {
               textFormat: Text.PlainText
               anchors.verticalCenter: parent.verticalCenter
-              text: "Extend to"
+              text: "Refresh rate"
               color: root.foreground
               opacity: 0.6
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
             }
             Repeater {
-              model: [
-                { id: "left", label: "Left" },
-                { id: "up", label: "Above" },
-                { id: "right", label: "Right" },
-                { id: "down", label: "Below" }
-              ]
+              model: root.status.fpsRates || []
               delegate: Chip {
                 required property var modelData
-                label: modelData.label
-                active: root.status.position === modelData.id
-                onClicked: root.adjust(["position", modelData.id])
+                label: root.rateLabel(modelData)
+                active: root.sameRate(modelData, root.status.fps)
+                onClicked: root.adjust(["fps", "set", String(modelData)])
               }
+            }
+            Text {
+              textFormat: Text.PlainText
+              anchors.verticalCenter: parent.verticalCenter
+              visible: (root.status.fpsRates || []).length < 2
+              text: "The only rate at this resolution"
+              color: root.foreground
+              opacity: 0.45
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
             }
           }
 
@@ -299,7 +328,7 @@ Item {
             Text {
               textFormat: Text.PlainText
               anchors.verticalCenter: parent.verticalCenter
-              text: "Size " + Math.round((root.status.scale || 1) * 100) + "%"
+              text: "Text size " + Math.round((root.status.scale || 1) * 100) + "%"
               color: root.foreground
               opacity: 0.6
               font.family: root.fontFamily
@@ -308,15 +337,55 @@ Item {
             Chip { label: "Bigger"; onClicked: root.adjust(["scale", "up"]) }
             Chip { label: "Smaller"; onClicked: root.adjust(["scale", "down"]) }
             Chip { label: "Auto"; onClicked: root.adjust(["scale", "reset"]) }
+            Text {
+              textFormat: Text.PlainText
+              anchors.verticalCenter: parent.verticalCenter
+              text: "Applies to Extend and Second screen only"
+              color: root.foreground
+              opacity: 0.45
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
           }
 
-          // For a desk monitor already set up in your own monitors.lua.
-          Chip {
-            label: "Don't manage"
-            active: root.status.display === "ignore"
-            onClicked: {
-              root.run(["set", "ignore"])
-              root.dismiss()
+          Row {
+            spacing: Style.spacing.xxl
+
+            Row {
+              spacing: Style.spacing.sm
+              Text {
+                textFormat: Text.PlainText
+                anchors.verticalCenter: parent.verticalCenter
+                text: "Extend to"
+                color: root.foreground
+                opacity: 0.6
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+              Repeater {
+                model: [
+                  { id: "left", label: "Left" },
+                  { id: "up", label: "Above" },
+                  { id: "right", label: "Right" },
+                  { id: "down", label: "Below" }
+                ]
+                delegate: Chip {
+                  required property var modelData
+                  label: modelData.label
+                  active: root.status.position === modelData.id
+                  onClicked: root.adjust(["position", modelData.id])
+                }
+              }
+            }
+
+            // For a desk monitor already set up in your own monitors.lua.
+            Chip {
+              label: "Don't manage"
+              active: root.status.display === "ignore"
+              onClicked: {
+                root.run(["set", "ignore"])
+                root.dismiss()
+              }
             }
           }
         }
@@ -383,7 +452,7 @@ Item {
 
         Text {
           textFormat: Text.PlainText
-          text: "←/→ or P to choose   Enter to apply   1–5 apply directly   +/− size   Esc to close"
+          text: "←/→ or P to choose   Enter to apply   1–5 apply directly   [ ] refresh rate   +/− text size   Esc to close"
           color: root.foreground
           opacity: 0.4
           font.family: root.fontFamily

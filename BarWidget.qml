@@ -118,6 +118,8 @@ BarWidget {
     tooltipText: !root.status.connected ? "Present the Screen"
       : "Present the Screen · " + (root.modeNames[root.status.display] || "Duplicate")
         + "\n" + (root.status.displayName || root.status.label)
+        + "\n" + root.status.resolution + " · " + Math.round(root.status.fps || 0) + " Hz · "
+          + Math.round((root.status.scale || 1) * 100) + "% text size"
         + (root.activeSound !== "" ? "\nSound: " + root.activeSound : "")
         + "\nBrightness " + (root.status.brightness || 100) + "%"
         + (root.status.brightnessMethod === "dim" ? " (dimmed)" : "")
