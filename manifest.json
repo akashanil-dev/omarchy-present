@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.akashanil-dev.present",
   "name": "Present the Screen",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "author": "Akash A",
   "license": "MIT",
   "description": "Windows-style projector modes (SUPER + P): Duplicate without stretching or matched to the TV, Extend, laptop or second screen only, with sound output, brightness and a bar icon.",

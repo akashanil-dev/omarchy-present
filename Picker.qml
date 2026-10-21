@@ -174,6 +174,7 @@ Item {
         Column {
           spacing: Style.spacing.xs
           Text {
+            textFormat: Text.PlainText
             text: "Present the Screen"
             color: root.foreground
             font.family: root.fontFamily
@@ -181,6 +182,7 @@ Item {
             font.bold: true
           }
           Text {
+            textFormat: Text.PlainText
             text: !root.status.connected ? "No external display connected"
               : (root.status.displayName || root.status.label) + "  ·  " + root.status.resolution
                 + (root.status.display === "ignore" ? "  ·  left to your Hyprland config" : "")
@@ -228,6 +230,7 @@ Item {
                 spacing: Style.spacing.xxs
 
                 Text {
+                  textFormat: Text.PlainText
                   anchors.horizontalCenter: parent.horizontalCenter
                   text: (tile.index + 1) + "  " + tile.modelData.title
                   color: tile.index === root.selectedIndex ? root.accent : root.foreground
@@ -236,6 +239,7 @@ Item {
                   font.bold: tile.current
                 }
                 Text {
+                  textFormat: Text.PlainText
                   anchors.horizontalCenter: parent.horizontalCenter
                   text: (tile.modelData.id === "duplicate" || tile.modelData.id === "match") && !root.status.mirrorAvailable
                     ? "Needs wl-mirror" : (tile.current ? "Current" : tile.modelData.hint)
@@ -266,6 +270,7 @@ Item {
           Row {
             spacing: Style.spacing.sm
             Text {
+              textFormat: Text.PlainText
               anchors.verticalCenter: parent.verticalCenter
               text: "Extend to"
               color: root.foreground
@@ -292,6 +297,7 @@ Item {
           Row {
             spacing: Style.spacing.sm
             Text {
+              textFormat: Text.PlainText
               anchors.verticalCenter: parent.verticalCenter
               text: "Size " + Math.round((root.status.scale || 1) * 100) + "%"
               color: root.foreground
@@ -326,6 +332,7 @@ Item {
             spacing: Style.spacing.sm
             visible: (root.status.audio || []).length > 0
             Text {
+              textFormat: Text.PlainText
               anchors.verticalCenter: parent.verticalCenter
               text: "Sound"
               color: root.foreground
@@ -347,6 +354,7 @@ Item {
           Row {
             spacing: Style.spacing.sm
             Text {
+              textFormat: Text.PlainText
               anchors.verticalCenter: parent.verticalCenter
               text: "Brightness " + (root.status.brightness || 100) + "%"
               color: root.foreground
@@ -358,6 +366,7 @@ Item {
             Chip { label: "Brighter"; onClicked: root.adjust(["brightness", "up"]) }
             Chip { label: "Full"; onClicked: root.adjust(["brightness", "reset"]) }
             Text {
+              textFormat: Text.PlainText
               anchors.verticalCenter: parent.verticalCenter
               visible: text !== ""
               text: root.status.brightnessMethod === "ddc" ? "Set on the display itself"
@@ -373,6 +382,7 @@ Item {
         }
 
         Text {
+          textFormat: Text.PlainText
           text: "←/→ or P to choose   Enter to apply   1–5 apply directly   +/− size   Esc to close"
           color: root.foreground
           opacity: 0.4
@@ -397,6 +407,7 @@ Item {
     border.color: active ? root.accent : Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.15)
 
     Text {
+      textFormat: Text.PlainText
       id: chipText
       anchors.centerIn: parent
       text: chip.label
@@ -440,6 +451,7 @@ Item {
         border.color: Qt.rgba(diagramRoot.ink.r, diagramRoot.ink.g, diagramRoot.ink.b, on ? 0.85 : 0.35)
 
         Text {
+          textFormat: Text.PlainText
           anchors.centerIn: parent
           visible: parent.on
           text: diagramRoot.mode === "duplicate" || diagramRoot.mode === "match" ? "1" : String(index + 1)

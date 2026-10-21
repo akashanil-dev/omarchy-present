@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.1.2
+
+- Display, sound device and card names are shown as plain text, so a
+  device name can't be read as formatting or load an image.
+
 ## 1.1.1
 
 - The bar icon is a monitor with a "+" in its screen, so it isn't mistaken

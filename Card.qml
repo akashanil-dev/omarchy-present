@@ -121,6 +121,7 @@ Item {
           spacing: 20 * card.u
 
           Text {
+            textFormat: Text.PlainText
             visible: root.title !== ""
             width: parent.width
             text: root.title
@@ -141,6 +142,7 @@ Item {
           }
 
           Text {
+            textFormat: Text.PlainText
             visible: root.name !== ""
             width: parent.width
             text: root.name
@@ -153,6 +155,7 @@ Item {
           }
 
           Text {
+            textFormat: Text.PlainText
             visible: root.site !== ""
             width: parent.width
             text: root.site
@@ -192,6 +195,7 @@ Item {
           }
 
           Text {
+            textFormat: Text.PlainText
             width: 380 * card.u
             horizontalAlignment: Text.AlignHCenter
             text: "Scan to open"
@@ -216,6 +220,7 @@ Item {
           readonly property bool twelveHour: /a/i.test(Qt.locale().timeFormat(Locale.ShortFormat))
 
           Text {
+            textFormat: Text.PlainText
             id: time
             text: Qt.formatTime(clock.date, clockBlock.twelveHour ? "h:mm" : "HH:mm")
             color: Color.foreground
@@ -225,6 +230,7 @@ Item {
           }
 
           Text {
+            textFormat: Text.PlainText
             id: meridiem
             visible: clockBlock.twelveHour
             anchors.left: time.right
@@ -237,6 +243,7 @@ Item {
           }
 
           Text {
+            textFormat: Text.PlainText
             id: date
             anchors.left: meridiem.visible ? meridiem.right : time.right
             anchors.leftMargin: 32 * card.u
