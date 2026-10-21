@@ -2,8 +2,9 @@
 
 Windows-style projector modes for [Omarchy](https://omarchy.org). Plug in a
 projector or TV, press `SUPER + P`, pick a mode. Present the Screen ("Present"
-below) also picks where the sound goes, dims a TV that's too bright, and shows
-the current mode in the bar.
+below) also picks where the sound goes, dims a TV that's too bright, sets the
+refresh rate and text size for the second screen, and shows the current mode in
+the bar.
 
 ![The Present the Screen picker](preview.png)
 
@@ -32,7 +33,8 @@ Presenting from Hyprland usually goes wrong in two ways:
 
 ## What happens when you plug in
 
-- **A display seen before** gets its saved mode, position and size back.
+- **A display seen before** gets its saved mode, position, size and refresh rate
+  back.
 - **A new display** starts in Duplicate and the picker opens.
 - **Unplugging** returns everything to the laptop screen, including turning it
   back on after Second screen only.
@@ -44,7 +46,8 @@ talk isn't interrupted. `SUPER + L` still locks, and the projector then shows
 the lock screen rather than your desktop.
 
 A display whose native mode is below 50Hz (a TV's 4K@30, for example) is driven
-at its largest mode of 50Hz or more instead.
+at its largest mode of 50Hz or more instead. Pick another rate in the picker if
+you would rather have the low one.
 
 ## Install
 
@@ -86,24 +89,48 @@ displays are kept.
 | `←` `→`, or `P` | Choose a mode |
 | `Enter` | Apply it |
 | `1`–`5` | Apply a mode directly |
-| `+` `−` | Bigger or smaller (Extend and Second screen only) |
+| `+` `−` | Bigger or smaller text (Extend and Second screen only) |
+| `[` `]` | Lower or higher refresh rate |
 | `0` | Back to the automatic size |
 | `Esc` | Close |
 
-Below the modes: where an extended display sits and how big things are on it,
-which output the sound plays from, and the display's brightness. **Don't
-manage** hands the display back to your own Hyprland config, for a desk monitor
-you have already set up in `monitors.lua`.
+Below the modes: the display's refresh rate and text size, where an extended
+display sits, which output the sound plays from, and the display's brightness.
+**Don't manage** hands the display back to your own Hyprland config, for a desk
+monitor you have already set up in `monitors.lua`.
 
 Everything is also available from a terminal:
 
 ```bash
 P=~/.config/omarchy/plugins/io.github.akashanil-dev.present/bin/present
-$P status                       # JSON: the display and its saved mode
+$P status                       # JSON: the display, its saved mode, scale and FPS
 $P set duplicate                # duplicate | match | extend | external | internal | ignore
 $P position up                  # right | left | up | down
-$P scale up                     # up | down | reset
+$P scale up                     # up | down | reset | set <percent>
+$P fps up                       # up | down | reset | set <hz>; alone: JSON of the rates
 $P title "Back at 3:15"         # top line of the card; no text clears it
+```
+
+### Refresh rate and text size
+
+The picker lists every refresh rate the display offers at its current
+resolution, with the one in use highlighted; pick one to switch. `[` and `]`
+step through them without reaching for the mouse. The choice is saved for that
+display, so a monitor that comes up at 60 Hz can be set to 120 Hz once and
+stays there. A rate the display drops out on is not saved; Present goes back to
+the previous one.
+
+**Text size** (`+`, `−`, `0`, or Bigger/Smaller/Auto) scales the desktop on the
+external display, so a 4K TV shows readable text and a projector doesn't.
+Present still picks a sensible starting size for a new display: whatever makes
+it look like a 1080p screen. Size applies to Extend and Second screen only;
+Duplicate and Match the TV fit the picture to the display on their own.
+
+```bash
+$P fps                          # {"resolution":"1920x1080","current":60,"rates":[50,60,120],"auto":60}
+$P fps set 120
+$P fps reset                    # back to the display's preferred rate
+$P scale set 150                # 150%
 ```
 
 ### Match the TV
@@ -150,8 +177,8 @@ $P brightness down              # up | down | reset
 ### Bar icon
 
 While an external display is connected, an icon in the bar shows the mode.
-Hover for the mode, display, sound output and brightness; click for the
-picker; scroll for brightness. Add it with
+Hover for the mode, display, resolution, refresh rate, text size, sound output
+and brightness; click for the picker; scroll for brightness. Add it with
 `omarchy plugin enable io.github.akashanil-dev.present --section right`, or
 move it like any other bar widget.
 
@@ -193,8 +220,9 @@ nothing burns into a TV left on all day.
   `hyprctl eval`, the way Omarchy's own `SUPER + /` scaling key works. A config
   reload drops them, and the plugin applies them again right after.
 - **Duplicate and Match the TV** use [wl-mirror](https://github.com/Ferdi265/wl-mirror). The
-  external display runs at its native mode, placed far away from the laptop
-  display so the cursor and new windows can't land on it, and wl-mirror fills it
+  external display runs at its own resolution (and the refresh rate you chose),
+  placed far away from the laptop display so the cursor and new windows can't
+  land on it, and wl-mirror fills it
   on a workspace of its own (`present`), so `SUPER + 1`–`9` stay on the laptop.
   If wl-mirror exits unexpectedly, it is restarted.
 - **The laptop screen** is turned off through Omarchy's own toggle file (the
@@ -212,7 +240,7 @@ Files it writes:
 
 | Path | Contents |
 |---|---|
-| `~/.local/state/io.github.akashanil-dev.present/displays.json` | Each display's saved mode, position, size, sound output and brightness |
+| `~/.local/state/io.github.akashanil-dev.present/displays.json` | Each display's saved mode, position, scale, refresh rate, sound output and brightness |
 | `~/.local/state/io.github.akashanil-dev.present/present.log` | What happened and when, trimmed to a few hundred lines |
 | `$XDG_RUNTIME_DIR/io.github.akashanil-dev.present/` | A lock file, the rules applied in this session, what the card and dimming layer show, and the QR code |
 | `~/.local/state/omarchy/toggles/hypr/internal-monitor-disable.lua` | Omarchy's own laptop-screen-off flag, in Second screen only |

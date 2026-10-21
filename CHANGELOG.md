@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.2.0
+
+- Refresh rate (FPS) for the external display is settable from the picker: every
+  rate the display offers at its current resolution is listed, `[` and `]` step
+  through them, and the choice is saved per display and put back on reconnect.
+  `present fps [up|down|reset|set <hz>]`.
+- Text size has its own row in the picker, and any percentage can be set with
+  `present scale set <percent>`. `+`, `−` and `0` still work.
+- The bar tooltip shows the resolution, refresh rate and text size.
+- The picker opens on the laptop screen rather than whichever display happens to
+  be first, and falls back to the remaining screen in Second screen only.
+
 ## 1.1.2
 
 - Display, sound device and card names are shown as plain text, so a

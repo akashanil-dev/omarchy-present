@@ -5,7 +5,11 @@
 #   present status                      JSON state for the picker
 #   present set <mode>                  duplicate | match | extend | external | internal | ignore
 #   present position <dir>              extend direction: right | left | up | down
-#   present scale <up|down|reset>       external display scale
+#   present scale [up|down|reset|set <percent>]
+#                                       external display scale
+#   present fps [up|down|reset|set <hz>]
+#                                       external display refresh rate (as JSON when
+#                                       no argument: current, available rates, auto)
 #   present hotplug [--force]           reconcile after a display was added/removed
 #                                       (--force: a config reload also happened)
 #   present reapply                     re-apply after Hyprland reloaded its config
@@ -174,14 +178,36 @@ auto_scale() {
   clean_scale "$(awk -v h="$2" 'BEGIN { s = h / 1080; printf "%.4f", (s < 1 ? 1 : s) }')" "$1" "$2"
 }
 
+# The refresh rate of the mode a new display would get: its preferred rate, or
+# the rate of the largest mode at 50Hz or more for a TV stuck at 4K@30.
+auto_fps() {
+  local monitor="$1" mode
+  mode=$(pick_mode "$monitor")
+  if [[ $mode == preferred ]]; then
+    jq -r '.refreshRate // 0' <<<"$monitor"
+  else
+    echo "${mode##*@}"
+  fi
+}
+
+# The rate 0 / Auto should return to: the saved one, or for a profile from
+# before refresh control existed, the display's preferred rate now.
+best_auto_fps() {
+  local monitor="$1" rates="$2" auto
+  auto=$(auto_fps "$monitor")
+  awk -v a="$auto" 'BEGIN { exit !(a > 0) }' || auto=$(jq -r 'max // 0' <<<"$rates")
+  echo "$auto"
+}
+
 # Profile for a display seen for the first time: Duplicate, like plugging a
 # projector into Windows.
 new_profile() {
-  local monitor="$1" mode w h
+  local monitor="$1" mode w h fps
   mode=$(pick_mode "$monitor")
   read -r w h <<<"$(mode_size "$monitor" "$mode")"
-  jq -nc --arg mode "$mode" --argjson scale "$(auto_scale "$w" "$h")" --argjson w "$w" --argjson h "$h" \
-    '{display: "duplicate", position: "right", mode: $mode, scale: $scale, autoScale: $scale, width: $w, height: $h}'
+  fps=$(auto_fps "$monitor")
+  jq -nc --arg mode "$mode" --argjson scale "$(auto_scale "$w" "$h")" --argjson w "$w" --argjson h "$h" --argjson fps "$fps" \
+    '{display: "duplicate", position: "right", mode: $mode, scale: $scale, autoScale: $scale, width: $w, height: $h, fps: $fps, autoFps: $fps}'
 }
 
 monitor_rule() {
@@ -698,7 +724,7 @@ cmd_position() {
 }
 
 cmd_scale() {
-  local step="$1" monitor name key profile current width height next i
+  local step="$1" value="${2:-}" monitor name key profile current width height next i
   require_primary
   current=$(profile_field "$profile" scale)
   width=$(profile_field "$profile" width)
@@ -706,6 +732,10 @@ cmd_scale() {
 
   case $step in
     reset) next=$(profile_field "$profile" autoScale) ;;
+    set)
+      [[ $value =~ ^[0-9]+([.][0-9]+)?$ ]] || { echo "Usage: present scale set <percent>" >&2; exit 1; }
+      next=$(awk -v p="$value" 'BEGIN { printf "%.4f", p / 100 }')
+      ;;
     up | down)
       next=$current
       if [[ $step == up ]]; then
@@ -717,10 +747,13 @@ cmd_scale() {
           awk -v a="${SCALES[i]}" -v b="$current" 'BEGIN { exit !(a < b - 0.01) }' && { next=${SCALES[i]}; break; }
         done
       fi
-      next=$(clean_scale "$next" "$width" "$height")
       ;;
-    *) echo "Usage: present scale <up|down|reset>" >&2; exit 1 ;;
+    *) echo "Usage: present scale [up|down|reset|set <percent>]" >&2; exit 1 ;;
   esac
+
+  # Keep it in a range that stays usable and that Hyprland accepts.
+  next=$(awk -v s="${next:-$current}" 'BEGIN { if (s < 0.5) s = 0.5; if (s > 4) s = 4; printf "%.4f", s }')
+  next=$(clean_scale "$next" "$width" "$height")
 
   profile_put "$key" "$(jq -c --argjson s "$next" '.scale = $s' <<<"$profile")"
   apply
@@ -881,6 +914,124 @@ audio_restore_later() {
   disown
 }
 
+# --- Refresh rate (FPS) ----------------------------------------------------
+#
+# The refresh rate is part of Hyprland's mode string (WxH@Hz), so it is set the
+# same way as everything else: pick another rate the display offers at the same
+# pixel size, save it in the profile, and apply. No config files, no DDC/CI:
+# TVs and projectors rarely answer VCP 60, and Hyprland already knows every
+# mode the display reports.
+
+# Refresh rates the display offers at WxH, smallest first, as JSON numbers.
+# Falls back to the rate in use when Hyprland lists no modes (a display whose
+# EDID was not read yet).
+refresh_rates() {
+  local monitor="$1" w="$2" h="$3" rates='[]'
+  if [[ $w =~ ^[0-9]+$ && $h =~ ^[0-9]+$ ]]; then
+    rates=$(jq -c --argjson w "$w" --argjson h "$h" '
+      [.availableModes[] | capture("^(?<w>[0-9]+)x(?<h>[0-9]+)@(?<r>[0-9.]+)")
+       | select((.w | tonumber) == $w and (.h | tonumber) == $h)
+       | (.r | tonumber)] | unique | sort
+      | reduce .[] as $r ([]; if length > 0 and ($r - .[-1]) < 0.6 then .[:-1] + [$r] else . + [$r] end)' <<<"$monitor" 2>/dev/null) || rates='[]'
+    [[ -n $rates ]] || rates='[]'
+  fi
+  if [[ $rates == "[]" ]]; then
+    rates=$(jq -c '[.refreshRate // 0 | select(. > 0)]' <<<"$monitor" 2>/dev/null) || rates='[]'
+    [[ -n $rates ]] || rates='[]'
+  fi
+  echo "$rates"
+}
+
+# The rate next to TARGET in RATES: up, down, or ("set") the one that matches.
+pick_rate() {
+  local rates="$1" target="$2" dir="$3"
+  jq -r --argjson t "$target" --arg d "$dir" '
+    if $d == "up" then [.[] | select(. > $t + 0.4)] | min
+    elif $d == "down" then [.[] | select(. < $t - 0.4)] | max
+    else [.[] | select(((. - $t) as $d | if $d < 0 then (0 - $d) else $d end) < 0.6)] | min
+    end // empty' <<<"$rates"
+}
+
+# Choose a new refresh rate at the current pixel size and apply it. The profile
+# is put back if the display drops out, like any other mode change.
+cmd_fps() {
+  local step="${1:-}" wanted="${2:-}" monitor name key profile display mode w h rates current next old old_fps auto saved_auto
+  require_primary
+  display=$(profile_field "$profile" display)
+  if [[ $display == ignore ]]; then
+    notify "Not managed by Present" "$(display_name "$key") follows your Hyprland config."
+    return 1
+  fi
+  mode=$(profile_field "$profile" mode)
+  read -r w h <<<"$(mode_size "$monitor" "$mode")"
+  rates=$(refresh_rates "$monitor" "$w" "$h")
+  # Step from what we last set, so a stale Hyprland read can't make "50" look
+  # like the current rate when it isn't.
+  current=$(profile_field "$profile" fps)
+  [[ -n $current && $current != null ]] || current=$(jq -r '.refreshRate // 0' <<<"$monitor")
+  old_fps=$current
+  auto=$(profile_field "$profile" autoFps)
+  saved_auto=$auto
+  [[ -n $auto && $auto != null ]] || auto=$(best_auto_fps "$monitor" "$rates")
+
+  if [[ -z $step ]]; then
+    jq -nc --argjson rates "$rates" --argjson current "$current" \
+      --argjson auto "$auto" \
+      --arg resolution "${w}x$h" \
+      '{resolution: $resolution, current: $current, rates: $rates, auto: $auto}'
+    return
+  fi
+
+  # A profile saved before refresh control existed has no autoFps yet: remember
+  # the rate it had before this change, so 0 / Auto has somewhere to go back to.
+  if [[ -z $saved_auto || $saved_auto == null ]]; then
+    profile=$(jq -c --argjson a "$auto" '.autoFps = $a' <<<"$profile")
+    profile_put "$key" "$profile"
+  fi
+
+  case $step in
+    up | down)
+      next=$(pick_rate "$rates" "$current" "$step")
+      ;;
+    set)
+      [[ $wanted =~ ^[0-9]+([.][0-9]+)?$ ]] || { echo "Usage: present fps set <hz>" >&2; exit 1; }
+      next=$(pick_rate "$rates" "$wanted" set)
+      ;;
+    reset)
+      next=$auto
+      ;;
+    *)
+      echo "Usage: present fps [up|down|reset|set <hz>]" >&2
+      exit 1
+      ;;
+  esac
+
+  if [[ -z $next || $next == null ]]; then
+    if [[ $step == set ]]; then
+      notify "No such refresh rate" "$(display_name "$key") doesn't offer ${wanted} Hz at ${w}x$h."
+      return 1
+    fi
+    # Already at the top or bottom of what the display offers.
+    return 0
+  fi
+  if awk -v a="$next" -v b="$current" 'BEGIN { exit !(a == b) }'; then
+    return 0
+  fi
+
+  old="$profile"
+  profile_put "$key" "$(jq -c --arg m "${w}x${h}@${next}" --argjson f "$next" '.mode = $m | .fps = $f' <<<"$profile")"
+  apply
+
+  if ! mode_took "$display" "$name"; then
+    log "fps: $name dropped out at $next Hz; back to $old_fps Hz"
+    profile_put "$key" "$old"
+    apply 1
+    notify "Couldn't change the refresh rate" "$(display_name "$key") dropped out during the change. Kept $old_fps Hz."
+    return 1
+  fi
+  log "fps: $name now ${w}x${h}@$next Hz"
+}
+
 # --- Brightness ------------------------------------------------------------
 #
 # A monitor that speaks DDC/CI gets its real backlight changed with ddcutil.
@@ -969,7 +1120,7 @@ cmd_title() {
 }
 
 cmd_status() {
-  local monitor key="" profile="null"
+  local monitor key="" profile="null" rates="[]" w="" h="" autofps="null"
   monitor=$(primary)
   # A display without modes can't take any mode yet; the picker shows none.
   [[ -n $monitor ]] && ! usable "$monitor" && monitor=""
@@ -977,12 +1128,18 @@ cmd_status() {
     key=$(display_key "$monitor")
     profile=$(profile_get "$key")
     [[ -n $profile ]] || profile=$(new_profile "$monitor")
+    read -r w h <<<"$(mode_size "$monitor" "$(profile_field "$profile" mode)")"
+    rates=$(refresh_rates "$monitor" "$w" "$h")
+    autofps=$(profile_field "$profile" autoFps)
+    [[ -n $autofps && $autofps != null ]] || autofps=$(best_auto_fps "$monitor" "$rates")
   fi
 
   jq -nc \
     --argjson monitor "${monitor:-null}" \
     --argjson profile "$profile" \
     --arg key "$key" \
+    --argjson rates "$rates" \
+    --argjson autofps "$autofps" \
     --argjson mirror "$(command -v wl-mirror >/dev/null && echo true || echo false)" \
     --argjson audio "$(audio_outputs)" \
     --argjson ddcutil "$(command -v ddcutil >/dev/null && echo true || echo false)" \
@@ -995,6 +1152,10 @@ cmd_status() {
       display: ($profile.display // ""),
       position: ($profile.position // "right"),
       scale: ($profile.scale // 1),
+      scaleAuto: ($profile.autoScale // $profile.scale // 1),
+      fps: (if $monitor == null then 0 else ($monitor.refreshRate // $profile.fps // 0) end),
+      fpsRates: $rates,
+      fpsAuto: ($profile.autoFps // $autofps),
       mirrorAvailable: $mirror,
       audio: $audio,
       brightness: ($profile.brightness // 100),
@@ -1007,7 +1168,8 @@ case "${1:-}" in
   status) cmd_status ;;
   set) with_lock cmd_set "${2:-}" ;;
   position) with_lock cmd_position "${2:-}" ;;
-  scale) with_lock cmd_scale "${2:-}" ;;
+  scale) with_lock cmd_scale "${2:-}" "${3:-}" ;;
+  fps) with_lock cmd_fps "${2:-}" "${3:-}" ;;
   hotplug) with_lock cmd_hotplug "${2:-}" ;;
   reapply) with_lock apply 1 ;;
   title) shift; cmd_title "$@" ;;
@@ -1016,5 +1178,5 @@ case "${1:-}" in
   ddc-probe) with_lock cmd_ddc_probe ;;
   fit) with_lock cmd_fit ;;
   mirror) cmd_mirror "${2:-}" "${3:-}" "${4:-}" ;;
-  *) sed -n '3,16p' "$0"; exit 1 ;;
+  *) sed -n '3,17p' "$0"; exit 1 ;;
 esac
